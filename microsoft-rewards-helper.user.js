@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.1.0
+// @version      2.1.1
 // @description  Bing Rewards 助手：读取每日任务与搜索进度、抓取相关搜索词、以可配置的人类节奏执行搜索，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
@@ -21,7 +21,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.1.0';
+    const VERSION = '2.1.1';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -85,6 +85,12 @@
     /** 中断信号：停止搜索时用它把正在 await 的阶段安静地打断。 */
     const ABORT = Symbol('aborted');
 
+    /** 刷新循环检测：本标签页内「非脚本主动发起」的加载记录（sessionStorage）。 */
+    const NAV_FLAG_KEY = 'bing_rewards_intentional_nav';
+    const LOAD_LOG_KEY = 'bing_rewards_load_log';
+    const LOOP_WINDOW = 30 * 1000;   // 观察窗口
+    const LOOP_LIMIT = 3;            // 窗口内多少次意外加载算异常
+
     // ==========================================================================
     // 1. 配置与会话持久化
     // ==========================================================================
@@ -121,6 +127,7 @@
         mainTerms: [],
         iframeTerms: [],
         dailyTasks: [],
+        loopGuard: false,          // 检测到刷新循环后，禁止一切自动点击
         collapsed: true
     };
 
@@ -240,6 +247,53 @@
 
     function log(...args) {
         console.log('[RewardsHelper]', ...args);
+    }
+
+    /**
+     * 判断本次页面加载是不是脚本自己发起的（doSearch 跳转前会打标记）。
+     * 短时间内出现多次「非脚本发起」的加载，说明页面在被反复刷新——
+     * 这时必须停手，否则会一直循环下去。
+     */
+    function detectReloadLoop() {
+        let intentional = false;
+        try {
+            intentional = sessionStorage.getItem(NAV_FLAG_KEY) === '1';
+            sessionStorage.removeItem(NAV_FLAG_KEY);
+        } catch (e) { /* 忽略 */ }
+        if (intentional) return false;
+
+        let loads = [];
+        try {
+            loads = JSON.parse(sessionStorage.getItem(LOAD_LOG_KEY) || '[]');
+        } catch (e) { /* 忽略 */ }
+
+        const now = Date.now();
+        loads = loads.filter(t => now - t < LOOP_WINDOW).concat(now);
+        try {
+            sessionStorage.setItem(LOAD_LOG_KEY, JSON.stringify(loads));
+        } catch (e) { /* 忽略 */ }
+
+        return loads.length > LOOP_LIMIT;
+    }
+
+    function clearLoopGuard() {
+        state.loopGuard = false;
+        try {
+            sessionStorage.removeItem(LOAD_LOG_KEY);
+        } catch (e) { /* 忽略 */ }
+    }
+
+    /**
+     * 点击这个元素会不会把当前页面顶走？
+     * Bing 首页的积分入口是普通导航链接，而结果页的同名元素是打开侧栏的按钮。
+     * 分不清就点，会导致「点击 → 跳转 → 脚本重载 → 再点击」的无限刷新。
+     */
+    function navigatesAway(node) {
+        const anchor = node.closest && node.closest('a[href]');
+        if (!anchor) return false;
+        if (anchor.target && anchor.target !== '_self') return false;  // 新标签页顶不走当前页
+        const href = anchor.getAttribute('href') || '';
+        return !!href && !href.startsWith('#') && !/^javascript:/i.test(href);
     }
 
     // ==========================================================================
@@ -839,22 +893,27 @@
             '[data-testid="rewards-points"]', '.ms-rewards-link',
             '[aria-label*="积分"]', '[aria-label*="Rewards"]'
         ];
+        if (state.loopGuard) {
+            log('刷新循环保护生效中，不做任何点击');
+            return false;
+        }
+
         for (const selector of selectors) {
             const node = document.querySelector(selector);
-            if (node && node.offsetParent !== null) {
-                node.click();
-                log('已点击积分入口:', selector);
-                return true;
+            if (!node || node.offsetParent === null) continue;
+            if (navigatesAway(node)) {
+                // 首页的积分入口就是这种，点了会跳转，跳过它
+                log('跳过会导致跳转的积分入口:', selector);
+                continue;
             }
-        }
-        const link = [...document.querySelectorAll('a[href*="rewards"]')]
-            .find(a => !/account|profile|redeem/i.test(a.href));
-        if (link) {
-            link.click();
-            log('兜底点击了 rewards 链接');
+            node.click();
+            log('已点击积分入口:', selector);
             return true;
         }
-        log('未找到积分入口');
+
+        // 这里原本有一条「点击任意 rewards 链接」的兜底。那些链接全是导航链接，
+        // 点下去必然跳转，正是首页无限刷新的根源，因此整条移除。
+        log('未找到可安全点击的积分入口（可手动点开积分面板）');
         return false;
     }
 
@@ -1344,6 +1403,10 @@
         state.phaseUntil = 0;
         saveSession(); // 跳转前同步写入，绝不能丢
 
+        try {
+            sessionStorage.setItem(NAV_FLAG_KEY, '1');   // 标记：下一次加载是脚本自己发起的
+        } catch (e) { /* 忽略 */ }
+
         const url = new URL('/search', location.origin);
         url.searchParams.set('q', picked.term);
         url.searchParams.set('form', 'QBRE');
@@ -1412,6 +1475,8 @@
     }
 
     async function start() {
+        // 用户主动点了开始，说明他知道自己在做什么，解除刷新保护
+        clearLoopGuard();
         // 启动时的这次读取发生在任何搜索之前，不能算作“搜索了却没涨分”，
         // 否则连点几次开始就会被误判成需要休息。
         cycleScored = true;
@@ -1505,19 +1570,26 @@
             saveSession();
         });
 
+        if (detectReloadLoop()) {
+            state.loopGuard = true;
+            clearSession();
+            setButtonRunning(false);
+            setStatus('⚠ 检测到页面反复刷新，已暂停全部自动操作。请换到搜索结果页再开始。');
+            log('刷新循环保护已触发');
+            return;
+        }
+
         const saved = loadSession();
         if (saved) {
             restore(saved);
             runCycle(saved);
         } else {
-            // 空闲状态也读一次数据，方便用户先看清今天还差多少
+            // 空闲时只做被动读取，绝不点击页面上的任何元素。
+            // v2.1.0 及以前会在这里调用 openRewardsSidebar()，而首页的积分入口
+            // 是普通导航链接，点下去就跳转，重载后又点——首页会一直刷新。
             setTimeout(() => {
                 readMainPageTerms();
-                openRewardsSidebar();
-                setTimeout(() => {
-                    if (!readSidebar()) setStatus('未读到奖励数据，可点开积分面板后重试');
-                    else setStatus('就绪');
-                }, 2500);
+                setStatus(readSidebar() ? '就绪' : '就绪（点开积分面板可显示今日进度）');
             }, 1200);
         }
 
