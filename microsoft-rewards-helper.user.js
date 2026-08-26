@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.1.1
+// @version      2.2.0
 // @description  Bing Rewards 助手：读取每日任务与搜索进度、抓取相关搜索词、以可配置的人类节奏执行搜索，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
@@ -21,7 +21,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.1.1';
+    const VERSION = '2.2.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -102,7 +102,7 @@
         searchInterval: [12, 25],  // 两次搜索之间的随机间隔（秒）
         maxNoProgressCount: 3,     // 连续多少次无进度才休息
         pointsPerSearch: 3,        // 单次搜索的积分，仅用于估算“还需搜几次”
-        maxSearchesPerDay: 60,     // 安全上限：读不到进度时也不会无限循环
+        targetSearches: 40,        // 每天检索多少次。这是主要的终止条件，不依赖能否读到进度
         jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
         walkLength: [5, 8],        // 每个话题连续走几步后换新话题
         seedTopics: [...SEED_TOPICS], // 起始话题池，可在面板里编辑
@@ -128,6 +128,7 @@
         iframeTerms: [],
         dailyTasks: [],
         loopGuard: false,          // 检测到刷新循环后，禁止一切自动点击
+        sidebarFailures: 0,        // 连续读不到侧栏的次数，超限后不再浪费时间轮询
         collapsed: true
     };
 
@@ -170,7 +171,7 @@
         if (num(saved.waitTime, 0, 60)) config.waitTime = saved.waitTime;
         if (num(saved.maxNoProgressCount, 1, 10)) config.maxNoProgressCount = saved.maxNoProgressCount;
         if (num(saved.pointsPerSearch, 1, 10)) config.pointsPerSearch = saved.pointsPerSearch;
-        if (num(saved.maxSearchesPerDay, 5, 200)) config.maxSearchesPerDay = saved.maxSearchesPerDay;
+        if (num(saved.targetSearches, 1, 200)) config.targetSearches = saved.targetSearches;
         if (num(saved.jitterPercent, 0, 60)) config.jitterPercent = saved.jitterPercent;
         if (Array.isArray(saved.walkLength) && saved.walkLength.length === 2 &&
             num(saved.walkLength[0], 1, 50) && num(saved.walkLength[1], 1, 50) &&
@@ -218,6 +219,7 @@
             walkLimit: state.walkLimit,
             clickedOffers: [...state.clickedOffers],
             searchCount: state.searchCount,
+            sidebarFailures: state.sidebarFailures,
             day: state.day,
             updatedAt: Date.now()
         });
@@ -446,7 +448,7 @@
         { id: 'cfg-tolerance', label: '容错次数', min: 1, max: 10, get: () => config.maxNoProgressCount, set: v => { config.maxNoProgressCount = v; }, unit: '次' },
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
         { id: 'cfg-imax', label: '间隔上限(秒)', min: 1, max: 600, get: () => config.searchInterval[1], set: v => { config.searchInterval[1] = Math.max(v, config.searchInterval[0]); }, unit: '秒' },
-        { id: 'cfg-cap', label: '每日上限(次)', min: 5, max: 200, get: () => config.maxSearchesPerDay, set: v => { config.maxSearchesPerDay = v; }, unit: '次' },
+        { id: 'cfg-target', label: '检索次数', min: 1, max: 200, get: () => config.targetSearches, set: v => { config.targetSearches = v; }, unit: '次' },
         { id: 'cfg-jitter', label: '随机幅度(%)', min: 0, max: 60, get: () => config.jitterPercent, set: v => { config.jitterPercent = v; }, unit: '%' },
         { id: 'cfg-wmin', label: '话题步数下限', min: 1, max: 50, get: () => config.walkLength[0], set: v => { config.walkLength[0] = Math.min(v, config.walkLength[1]); }, unit: '步' },
         { id: 'cfg-wmax', label: '话题步数上限', min: 1, max: 50, get: () => config.walkLength[1], set: v => { config.walkLength[1] = Math.max(v, config.walkLength[0]); }, unit: '步' }
@@ -752,18 +754,27 @@
         setText('minimize-btn', state.collapsed ? '+' : '−');
     }
 
+    /**
+     * 进度显示一律以「已检索次数 / 目标次数」为准——这是脚本真正的终止条件，
+     * 任何时候都拿得到，不会再出现「进度: 未知」。
+     * 侧栏里的积分进度只作为附加信息，读到了才显示。
+     */
     function renderProgress() {
+        const done = state.searchCount;
+        const target = config.targetSearches;
         const p = state.progress;
-        if (!p.known) {
-            setText('rewards-progress', '进度: 未知');
-            return;
-        }
-        const suffix = p.completed ? ' (已完成)' : '';
-        setText('rewards-progress', `进度: ${p.current}/${p.total}${suffix}`);
+
+        let text = `检索: ${done}/${target} 次`;
+        if (done >= target) text += ' (已完成)';
+        if (p.known) text += ` · 积分 ${p.current}/${p.total}`;
+        setText('rewards-progress', text);
+
         const bar = $('rewards-progress-bar');
-        if (bar && p.total > 0) {
-            bar.style.width = clamp((p.current / p.total) * 100, 0, 100) + '%';
-            if (p.completed) bar.style.background = `linear-gradient(90deg,${getTheme().ok},#8BC34A)`;
+        if (bar) {
+            bar.style.width = clamp((done / Math.max(1, target)) * 100, 0, 100) + '%';
+            bar.style.background = done >= target
+                ? `linear-gradient(90deg,${getTheme().ok},#8BC34A)`
+                : `linear-gradient(90deg,${getTheme().accent},#00bcf2)`;
         }
     }
 
@@ -855,7 +866,11 @@
                   text-align:center;font-size:16px;`,
             children: [
                 el('div', { text: '任务完成！', css: 'font-weight:bold;margin-bottom:10px;font-size:18px;' }),
-                el('div', { text: `今日搜索奖励已拿满（${state.progress.current}/${state.progress.total}）` })
+                el('div', {
+                    text: state.progress.known
+                        ? `已检索 ${state.searchCount} 次 · 积分 ${state.progress.current}/${state.progress.total}`
+                        : `已检索 ${state.searchCount} 次`
+                })
             ]
         });
         el('button', {
@@ -1351,7 +1366,11 @@
     }
 
     async function checkPhase() {
-        setStatus('检查搜索进度...');
+        // 侧栏读不到并不影响主流程（终止条件是检索次数），所以连续失败 3 次后
+        // 就别再每轮白等 6 秒了。
+        if (state.sidebarFailures >= 3) return false;
+
+        setStatus('检查奖励面板...');
         state.phase = Phase.CHECK;
         saveSession();
 
@@ -1360,9 +1379,17 @@
         // 这里刻意用 sleep 而不是 waitSeconds：轮询不该反复写 localStorage，也不该刷倒计时。
         for (let i = 0; i < 12; i++) {
             await sleep(500);
-            if (readSidebar()) return true;
+            if (readSidebar()) {
+                state.sidebarFailures = 0;
+                return true;
+            }
         }
-        log('本轮未能读到侧栏数据');
+
+        state.sidebarFailures++;
+        log('本轮未能读到侧栏数据（第 ' + state.sidebarFailures + ' 次）');
+        if (state.sidebarFailures >= 3) {
+            setStatus('读不到奖励面板，后续不再尝试；按检索次数继续');
+        }
         return false;
     }
 
@@ -1382,11 +1409,8 @@
         return Math.max(1, Math.round(seconds * (1 + swing)));
     }
 
-    function estimateRemaining() {
-        const p = state.progress;
-        if (!p.known || p.completed) return 0;
-        // 进度行给的通常是积分而非次数，按每次搜索的积分折算，仅用于展示
-        return Math.max(1, Math.ceil((p.total - p.current) / config.pointsPerSearch));
+    function remainingSearches() {
+        return Math.max(0, config.targetSearches - state.searchCount);
     }
 
     /** 发起搜索：直接跳转比填表单提交更可靠（不依赖 Bing 表单里的隐藏字段与事件）。 */
@@ -1410,7 +1434,8 @@
         const url = new URL('/search', location.origin);
         url.searchParams.set('q', picked.term);
         url.searchParams.set('form', 'QBRE');
-        setStatus(`搜索: ${picked.term}（${picked.source}）· 话题「${state.currentTopic}」${state.walkSteps}/${state.walkLimit} 步 · 今日第 ${state.searchCount} 次 · 预计还需 ${estimateRemaining()} 次`);
+        setStatus(`搜索: ${picked.term}（${picked.source}）· 话题「${state.currentTopic}」${state.walkSteps}/${state.walkLimit} 步 · 第 ${state.searchCount}/${config.targetSearches} 次`);
+        renderProgress();
         location.assign(url.toString());
         return true;
     }
@@ -1434,14 +1459,17 @@
                 await checkPhase();
             }
 
-            if (state.progress.completed) {
+            // 主终止条件：检索够 targetSearches 次。不依赖能否读到进度。
+            if (state.searchCount >= config.targetSearches) {
                 showCompletionNotification();
-                stop('今日搜索奖励已拿满 🎉');
+                stop(`已完成 ${state.searchCount} 次检索 🎉`);
                 return;
             }
 
-            if (state.searchCount >= config.maxSearchesPerDay) {
-                stop(`已达每日上限 ${config.maxSearchesPerDay} 次，停止`);
+            // 附加提前结束：真读到了进度且已拿满，就没必要继续搜下去
+            if (state.progress.known && state.progress.completed) {
+                showCompletionNotification();
+                stop(`积分已拿满，共检索 ${state.searchCount} 次 🎉`);
                 return;
             }
 
@@ -1497,9 +1525,13 @@
         }
         if (!state.running) return;
 
-        if (state.progress.completed) {
+        if (state.searchCount >= config.targetSearches) {
+            stop(`今日已检索 ${state.searchCount} 次，达到设定次数`);
+            return;
+        }
+        if (state.progress.known && state.progress.completed) {
             showCompletionNotification();
-            stop('今日搜索奖励已拿满 🎉');
+            stop('积分已拿满，无需再搜');
             return;
         }
 
@@ -1550,6 +1582,7 @@
         state.walkLimit = saved.walkLimit || 0;
         state.clickedOffers = new Set(saved.clickedOffers || []);
         state.searchCount = saved.searchCount || 0;
+        state.sidebarFailures = saved.sidebarFailures || 0;
         state.day = saved.day || today();
         state.running = true;
         setButtonRunning(true);
