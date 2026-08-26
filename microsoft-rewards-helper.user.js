@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.0.0
+// @version      2.1.0
 // @description  Bing Rewards 助手：读取每日任务与搜索进度、抓取相关搜索词、以可配置的人类节奏执行搜索，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
@@ -21,7 +21,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.0.0';
+    const VERSION = '2.1.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -56,6 +56,22 @@
      * 避免一天的搜索全部落在同一个话题簇里。可在配置面板里自行编辑。
      */
     const SEED_TOPICS = [
+        'weather forecast', 'flight status', 'pasta recipe', 'NBA standings',
+        'GPU benchmark', 'IELTS test dates', 'cat vaccination schedule',
+        'mortgage rates', 'movie recommendations', 'beginner workout plan',
+        'Japan travel guide', 'electric car range', 'learn Python',
+        'vitamin D benefits', 'stock market news', 'kitchen remodel ideas',
+        'guitar chords for beginners', 'World War II timeline',
+        'calculus practice problems', 'coffee roast levels',
+        'phone photography tips', 'camping gear checklist',
+        'keto meal plan', 'houseplant care'
+    ];
+
+    /**
+     * v2.0 的中文默认话题。仅用于升级判断：存档里如果还是这份原样未改的列表，
+     * 就跟着换成新的英文默认值；只要用户自己编辑过，就尊重用户的列表不动它。
+     */
+    const LEGACY_SEED_TOPICS = [
         '天气预报', '高铁时刻表', '家常菜做法', 'NBA 比分', '显卡天梯图',
         '雅思报名', '猫咪驱虫', '房贷利率', '电影推荐', '健身计划',
         '日本旅游', '新能源汽车', '编程入门', '中医养生', '股票行情',
@@ -155,7 +171,9 @@
             config.walkLength = saved.walkLength.slice();
         }
         const topics = sanitizeTopics(saved.seedTopics);
-        if (topics.length >= 2) config.seedTopics = topics;
+        const isLegacyDefault = topics.length === LEGACY_SEED_TOPICS.length &&
+            topics.every((t, i) => t === LEGACY_SEED_TOPICS[i]);
+        if (topics.length >= 2 && !isLegacyDefault) config.seedTopics = topics;
         if (Array.isArray(saved.searchInterval) && saved.searchInterval.length === 2 &&
             num(saved.searchInterval[0], 1, 600) && num(saved.searchInterval[1], 1, 600) &&
             saved.searchInterval[0] <= saved.searchInterval[1]) {
