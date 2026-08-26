@@ -71,6 +71,7 @@
         maxNoProgressCount: 3,     // 连续多少次无进度才休息
         pointsPerSearch: 3,        // 单次搜索的积分，仅用于估算“还需搜几次”
         maxSearchesPerDay: 60,     // 安全上限：读不到进度时也不会无限循环
+        jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
         autoClickDailyTasks: true  // 自动点击未完成的每日奖励卡片
     };
 
@@ -130,6 +131,7 @@
         if (num(saved.maxNoProgressCount, 1, 10)) config.maxNoProgressCount = saved.maxNoProgressCount;
         if (num(saved.pointsPerSearch, 1, 10)) config.pointsPerSearch = saved.pointsPerSearch;
         if (num(saved.maxSearchesPerDay, 5, 200)) config.maxSearchesPerDay = saved.maxSearchesPerDay;
+        if (num(saved.jitterPercent, 0, 60)) config.jitterPercent = saved.jitterPercent;
         if (Array.isArray(saved.searchInterval) && saved.searchInterval.length === 2 &&
             num(saved.searchInterval[0], 1, 600) && num(saved.searchInterval[1], 1, 600) &&
             saved.searchInterval[0] <= saved.searchInterval[1]) {
@@ -337,7 +339,8 @@
         { id: 'cfg-tolerance', label: '容错次数', min: 1, max: 10, get: () => config.maxNoProgressCount, set: v => { config.maxNoProgressCount = v; }, unit: '次' },
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
         { id: 'cfg-imax', label: '间隔上限(秒)', min: 1, max: 600, get: () => config.searchInterval[1], set: v => { config.searchInterval[1] = Math.max(v, config.searchInterval[0]); }, unit: '秒' },
-        { id: 'cfg-cap', label: '每日上限(次)', min: 5, max: 200, get: () => config.maxSearchesPerDay, set: v => { config.maxSearchesPerDay = v; }, unit: '次' }
+        { id: 'cfg-cap', label: '每日上限(次)', min: 5, max: 200, get: () => config.maxSearchesPerDay, set: v => { config.maxSearchesPerDay = v; }, unit: '次' },
+        { id: 'cfg-jitter', label: '随机幅度(%)', min: 0, max: 60, get: () => config.jitterPercent, set: v => { config.jitterPercent = v; }, unit: '%' }
     ];
 
     function createUI() {
@@ -1083,7 +1086,7 @@
 
     function clearTimers() {
         if (tickerId) { clearInterval(tickerId); tickerId = null; }
-        if (scrollerId) { clearInterval(scrollerId); scrollerId = null; }
+        if (scrollerId) { clearTimeout(scrollerId); scrollerId = null; }
     }
 
     /** 等到 deadline，期间刷新倒计时；停止搜索会以 ABORT 拒绝。 */
@@ -1143,15 +1146,21 @@
     }
 
     function scrollPhase() {
-        setStatus('模拟浏览：滚动页面...');
-        clearInterval(scrollerId);
-        scrollerId = setInterval(() => {
+        const seconds = humanize(config.scrollTime);
+        setStatus(`模拟浏览：滚动页面 ${seconds} 秒...`);
+        clearTimeout(scrollerId);
+
+        // 每次滚动的间隔也随机（600~1600ms）。固定 1000ms 的节拍太规律，
+        // 真人的滚动是断续的：看一段、停一下、再滚。
+        const step = () => {
             const amount = 100 + Math.floor(Math.random() * 300);
             window.scrollBy({ top: Math.random() > 0.3 ? amount : -amount, behavior: 'smooth' });
-        }, 1000);
+            scrollerId = setTimeout(step, 600 + Math.floor(Math.random() * 1000));
+        };
+        scrollerId = setTimeout(step, 300 + Math.floor(Math.random() * 700));
 
-        return waitSeconds(config.scrollTime, Phase.SCROLL).finally(() => {
-            clearInterval(scrollerId);
+        return waitSeconds(seconds, Phase.SCROLL).finally(() => {
+            clearTimeout(scrollerId);
             scrollerId = null;
         });
     }
@@ -1175,6 +1184,17 @@
     function randomInterval() {
         const [min, max] = config.searchInterval;
         return min + Math.floor(Math.random() * (max - min + 1));
+    }
+
+    /**
+     * 给一个固定时长加上 ±jitterPercent 的随机浮动。
+     * 真人不会每次都停留恰好 8 秒、滚动恰好 10 秒——固定值本身就是特征。
+     * jitterPercent 为 0 时原样返回；传入 0 时恒为 0（用于关闭「停留」阶段）。
+     */
+    function humanize(seconds) {
+        if (!seconds || config.jitterPercent <= 0) return seconds;
+        const swing = (Math.random() * 2 - 1) * (config.jitterPercent / 100);
+        return Math.max(1, Math.round(seconds * (1 + swing)));
     }
 
     function estimateRemaining() {
@@ -1214,8 +1234,9 @@
             if (isResultsPage()) {
                 await scrollPhase();
                 if (config.waitTime > 0) {
-                    setStatus('停留片刻，等待 Bing 记账...');
-                    await waitSeconds(config.waitTime, Phase.SETTLE);
+                    const settle = humanize(config.waitTime);
+                    setStatus(`停留 ${settle} 秒，等待 Bing 记账...`);
+                    await waitSeconds(settle, Phase.SETTLE);
                 }
                 await checkPhase();
             } else {
@@ -1236,8 +1257,9 @@
 
             if (state.progress.noProgressCount >= config.maxNoProgressCount) {
                 state.progress.noProgressCount = 0;
-                setStatus(`连续 ${config.maxNoProgressCount} 次无进度，休息 ${Math.round(config.restTime / 60)} 分钟`);
-                await waitSeconds(config.restTime, Phase.REST);
+                const rest = humanize(config.restTime);
+                setStatus(`连续 ${config.maxNoProgressCount} 次无进度，休息 ${Math.round(rest / 60 * 10) / 10} 分钟`);
+                await waitSeconds(rest, Phase.REST);
             }
 
             readMainPageTerms();
