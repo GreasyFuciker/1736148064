@@ -49,12 +49,22 @@
     /** 只有命中这些 URL 的响应才会被解析，避免对全站所有请求做无谓的克隆与正则。 */
     const REWARDS_URL_RE = /(rewards|bingflyout|flyoutcontroller|getuserinfo|dailysetpromotions)/i;
 
-    /** 兜底搜索词，仅在页面上一个相关搜索都抓不到时使用。 */
-    const FALLBACK_TERMS = [
-        'iPhone', 'Tesla', 'NVIDIA', 'Microsoft', 'weather', 'news today',
-        'best movies', 'recipe', 'travel', 'technology', 'sports scores',
-        'stock market', 'music playlist', 'fitness tips', 'book reviews'
+    /**
+     * 起始话题池：彼此不相关，横跨天气/交通/美食/体育/硬件/教育/宠物/财经/
+     * 影视/健身/旅行/汽车/编程/养生/家居/音乐/历史/摄影/户外/语言等领域。
+     * 每个话题只作为一次随机游走的起点，走满若干步就换一个，
+     * 避免一天的搜索全部落在同一个话题簇里。可在配置面板里自行编辑。
+     */
+    const SEED_TOPICS = [
+        '天气预报', '高铁时刻表', '家常菜做法', 'NBA 比分', '显卡天梯图',
+        '雅思报名', '猫咪驱虫', '房贷利率', '电影推荐', '健身计划',
+        '日本旅游', '新能源汽车', '编程入门', '中医养生', '股票行情',
+        '装修风格', '吉他和弦', '二战历史', '考研数学', '咖啡豆推荐',
+        '手机摄影', '露营装备', '减肥食谱', '英语口语'
     ];
+
+    /** 近似判重时回看的最近词数量。 */
+    const RECENT_WINDOW = 6;
 
     /** 中断信号：停止搜索时用它把正在 await 的阶段安静地打断。 */
     const ABORT = Symbol('aborted');
@@ -72,6 +82,8 @@
         pointsPerSearch: 3,        // 单次搜索的积分，仅用于估算“还需搜几次”
         maxSearchesPerDay: 60,     // 安全上限：读不到进度时也不会无限循环
         jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
+        walkLength: [5, 8],        // 每个话题连续走几步后换新话题
+        seedTopics: [...SEED_TOPICS], // 起始话题池，可在面板里编辑
         autoClickDailyTasks: true  // 自动点击未完成的每日奖励卡片
     };
 
@@ -82,6 +94,11 @@
         phaseUntil: 0,             // 当前阶段的结束时间戳，跳转后据此续算
         progress: { current: 0, total: 0, completed: false, noProgressCount: 0, known: false },
         usedTerms: new Set(),      // 本日已搜过的词，跨跳转保留
+        recentTerms: [],           // 最近搜过的几个词，用于近似判重
+        usedTopics: new Set(),     // 本日已用过的起始话题
+        currentTopic: '',          // 当前话题
+        walkSteps: 0,              // 当前话题已走的步数
+        walkLimit: 0,              // 本话题这次要走的步数（随机 walkLength）
         clickedOffers: new Set(),  // 本日已点过的奖励卡片链接
         searchCount: 0,            // 本日已发起的搜索次数（安全上限用）
         day: today(),
@@ -132,6 +149,13 @@
         if (num(saved.pointsPerSearch, 1, 10)) config.pointsPerSearch = saved.pointsPerSearch;
         if (num(saved.maxSearchesPerDay, 5, 200)) config.maxSearchesPerDay = saved.maxSearchesPerDay;
         if (num(saved.jitterPercent, 0, 60)) config.jitterPercent = saved.jitterPercent;
+        if (Array.isArray(saved.walkLength) && saved.walkLength.length === 2 &&
+            num(saved.walkLength[0], 1, 50) && num(saved.walkLength[1], 1, 50) &&
+            saved.walkLength[0] <= saved.walkLength[1]) {
+            config.walkLength = saved.walkLength.slice();
+        }
+        const topics = sanitizeTopics(saved.seedTopics);
+        if (topics.length >= 2) config.seedTopics = topics;
         if (Array.isArray(saved.searchInterval) && saved.searchInterval.length === 2 &&
             num(saved.searchInterval[0], 1, 600) && num(saved.searchInterval[1], 1, 600) &&
             saved.searchInterval[0] <= saved.searchInterval[1]) {
@@ -142,6 +166,12 @@
 
     function saveConfig() {
         writeJSON(CONFIG_KEY, config);
+    }
+
+    /** 清洗用户输入的话题列表：去空白、去重、丢掉过长过短的行。 */
+    function sanitizeTopics(input) {
+        const lines = Array.isArray(input) ? input : String(input || '').split('\n');
+        return [...new Set(lines.map(t => String(t).trim()).filter(t => t.length >= 2 && t.length <= 60))];
     }
 
     /**
@@ -156,6 +186,11 @@
             phaseUntil: state.phaseUntil,
             progress: state.progress,
             usedTerms: [...state.usedTerms],
+            recentTerms: state.recentTerms,
+            usedTopics: [...state.usedTopics],
+            currentTopic: state.currentTopic,
+            walkSteps: state.walkSteps,
+            walkLimit: state.walkLimit,
             clickedOffers: [...state.clickedOffers],
             searchCount: state.searchCount,
             day: state.day,
@@ -340,7 +375,9 @@
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
         { id: 'cfg-imax', label: '间隔上限(秒)', min: 1, max: 600, get: () => config.searchInterval[1], set: v => { config.searchInterval[1] = Math.max(v, config.searchInterval[0]); }, unit: '秒' },
         { id: 'cfg-cap', label: '每日上限(次)', min: 5, max: 200, get: () => config.maxSearchesPerDay, set: v => { config.maxSearchesPerDay = v; }, unit: '次' },
-        { id: 'cfg-jitter', label: '随机幅度(%)', min: 0, max: 60, get: () => config.jitterPercent, set: v => { config.jitterPercent = v; }, unit: '%' }
+        { id: 'cfg-jitter', label: '随机幅度(%)', min: 0, max: 60, get: () => config.jitterPercent, set: v => { config.jitterPercent = v; }, unit: '%' },
+        { id: 'cfg-wmin', label: '话题步数下限', min: 1, max: 50, get: () => config.walkLength[0], set: v => { config.walkLength[0] = Math.min(v, config.walkLength[1]); }, unit: '步' },
+        { id: 'cfg-wmax', label: '话题步数上限', min: 1, max: 50, get: () => config.walkLength[1], set: v => { config.walkLength[1] = Math.max(v, config.walkLength[0]); }, unit: '步' }
     ];
 
     function createUI() {
@@ -482,6 +519,42 @@
                 ]
             });
         }
+
+        el('div', {
+            css: 'grid-column:1/-1;display:flex;flex-direction:column;gap:2px;margin-top:4px;',
+            parent: configForm,
+            children: [
+                el('label', {
+                    text: '起始话题（每行一个，至少 2 个）',
+                    attrs: { for: 'cfg-topics' },
+                    css: `font-size:10px;color:${t.textSecondary};`
+                }),
+                el('textarea', {
+                    id: 'cfg-topics',
+                    attrs: { rows: '5', spellcheck: 'false' },
+                    props: { value: config.seedTopics.join('\n') },
+                    css: `width:100%;box-sizing:border-box;background:${t.inputBg};color:${t.text};
+                          border:1px solid ${t.inputBorder};border-radius:4px;padding:4px 6px;
+                          font-size:11px;font-family:inherit;resize:vertical;`,
+                    on: {
+                        change: (e) => {
+                            const topics = sanitizeTopics(e.target.value);
+                            if (topics.length < 2) {
+                                // 少于 2 个话题就没法「跳到不相关的话题」了，驳回并还原
+                                e.target.value = config.seedTopics.join('\n');
+                                setStatus('至少需要 2 个起始话题，已还原');
+                                return;
+                            }
+                            config.seedTopics = topics;
+                            state.usedTopics.clear();
+                            saveConfig();
+                            e.target.value = topics.join('\n');
+                            setStatus(`起始话题已更新：${topics.length} 个`);
+                        }
+                    }
+                })
+            ]
+        });
 
         el('div', {
             css: 'grid-column:1/-1;display:flex;align-items:center;gap:6px;margin-top:2px;',
@@ -1026,50 +1099,85 @@
     // 5. 搜索词选择
     // ==========================================================================
 
-    function usingFallback() {
-        return !state.iframeTerms.length &&
-            state.mainTerms.length > 0 &&
-            state.mainTerms.every(t => FALLBACK_TERMS.includes(t));
+    /**
+     * 近似判重：光靠字符串相等挡不住「咖啡」→「咖啡豆」→「咖啡豆推荐」这种
+     * 换汤不换药的连续搜索。这里额外挡掉互相包含、以及用字高度重合的词。
+     */
+    function tooSimilar(a, b) {
+        const x = a.toLowerCase().replace(/\s+/g, '');
+        const y = b.toLowerCase().replace(/\s+/g, '');
+        if (!x || !y) return false;
+        if (x === y || x.includes(y) || y.includes(x)) return true;
+
+        const setA = new Set(x);
+        const setB = new Set(y);
+        let shared = 0;
+        for (const ch of setA) if (setB.has(ch)) shared++;
+        return shared / Math.min(setA.size, setB.size) >= 0.8;
     }
 
-    function ensureFallbackTerms() {
-        if (state.mainTerms.length || state.iframeTerms.length) return false;
-        state.mainTerms = [...FALLBACK_TERMS];
-        renderTermList('main-search-terms', state.mainTerms);
-        setStatus('页面无相关搜索词，改用兜底词库');
-        return true;
+    /** 记账：全天去重 + 维护最近词窗口。 */
+    function markUsed(term) {
+        state.usedTerms.add(term);
+        state.recentTerms.push(term);
+        while (state.recentTerms.length > RECENT_WINDOW) state.recentTerms.shift();
     }
 
-    function randomSuffix() {
-        const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-        const len = 2 + Math.floor(Math.random() * 3);
-        let out = '';
-        for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
-        return out;
+    /** 当前页面上还能用的词，主页面优先、侧栏次之，已用过和近似的都排除。 */
+    function availableTerms() {
+        const usable = (list) => list.filter(t =>
+            !state.usedTerms.has(t) && !state.recentTerms.some(r => tooSimilar(t, r)));
+        const main = usable(state.mainTerms);
+        if (main.length) return { terms: main, source: '主页面' };
+        return { terms: usable(state.iframeTerms), source: '侧栏' };
     }
 
+    /**
+     * 换一个与当前话题无关的新起点，并重新掷出这一轮要走的步数。
+     * 话题池用尽时洗牌重来；连话题带词全用过了返回 null，交回给页面词。
+     */
+    function nextTopic() {
+        const unused = (skipTopics) => config.seedTopics.filter(t =>
+            (skipTopics ? true : !state.usedTopics.has(t)) && !state.usedTerms.has(t));
+
+        let pool = unused(false);
+        if (!pool.length) {
+            state.usedTopics.clear();          // 一天里话题走完就重新洗牌
+            pool = unused(true);
+        }
+        if (!pool.length) return null;
+
+        const topic = pool[Math.floor(Math.random() * pool.length)];
+        const [min, max] = config.walkLength;
+        state.usedTopics.add(topic);
+        state.currentTopic = topic;
+        state.walkSteps = 0;
+        state.walkLimit = min + Math.floor(Math.random() * (max - min + 1));
+        markUsed(topic);
+        log(`切换话题:「${topic}」，本轮走 ${state.walkLimit} 步`);
+        return topic;
+    }
+
+    /**
+     * 选词。两种情况会跳到新话题而不是顺着当前结果页继续走：
+     *   1. 当前话题已经走满了掷出的步数；
+     *   2. 当前页面没有可用的新词（都用过或都太像）。
+     * 否则从当前结果页的相关搜索里随机取一个，这样话题是连贯的，
+     * 但每隔 5~8 步就会整体换到一个不相关的领域。
+     */
     function pickTerm() {
-        const pool = [
-            { terms: state.mainTerms.filter(t => !state.usedTerms.has(t)), source: usingFallback() ? '兜底' : '主页面' },
-            { terms: state.iframeTerms.filter(t => !state.usedTerms.has(t)), source: '侧栏' }
-        ];
+        const available = availableTerms();
+        const needNewTopic = state.walkSteps >= state.walkLimit || !available.terms.length;
 
-        let candidate = pool.find(p => p.terms.length);
-
-        // 全部用过：兜底词库可以加随机后缀复用，页面词则清空重来
-        if (!candidate) {
-            if (!state.mainTerms.length && !state.iframeTerms.length) return null;
-            log('搜索词已全部用过，重置');
-            state.usedTerms.clear();
-            candidate = state.mainTerms.length
-                ? { terms: state.mainTerms, source: usingFallback() ? '兜底' : '主页面' }
-                : { terms: state.iframeTerms, source: '侧栏' };
+        if (needNewTopic) {
+            const topic = nextTopic();
+            if (topic) return { term: topic, source: '新话题' };
+            if (!available.terms.length) return null;   // 话题池也空了
         }
 
-        const base = candidate.terms[Math.floor(Math.random() * candidate.terms.length)];
-        state.usedTerms.add(base);
-        // 兜底词库很小，加随机后缀让每次查询串不同，避免被判为重复搜索
-        return { term: usingFallback() ? `${base} ${randomSuffix()}` : base, source: candidate.source };
+        const base = available.terms[Math.floor(Math.random() * available.terms.length)];
+        markUsed(base);
+        return { term: base, source: available.source };
     }
 
     // ==========================================================================
@@ -1213,6 +1321,7 @@
         }
 
         state.searchCount++;
+        state.walkSteps++;
         state.phase = Phase.IDLE;
         state.phaseUntil = 0;
         saveSession(); // 跳转前同步写入，绝不能丢
@@ -1220,7 +1329,7 @@
         const url = new URL('/search', location.origin);
         url.searchParams.set('q', picked.term);
         url.searchParams.set('form', 'QBRE');
-        setStatus(`搜索: ${picked.term}（${picked.source}）· 第 ${state.searchCount} 次 · 预计还需 ${estimateRemaining()} 次`);
+        setStatus(`搜索: ${picked.term}（${picked.source}）· 话题「${state.currentTopic}」${state.walkSteps}/${state.walkLimit} 步 · 今日第 ${state.searchCount} 次 · 预计还需 ${estimateRemaining()} 次`);
         location.assign(url.toString());
         return true;
     }
@@ -1263,7 +1372,6 @@
             }
 
             readMainPageTerms();
-            ensureFallbackTerms();
 
             const gap = randomInterval();
             setStatus(`等待 ${gap} 秒后进行下一次搜索`);
@@ -1312,12 +1420,7 @@
             return;
         }
 
-        ensureFallbackTerms();
-        if (!state.mainTerms.length && !state.iframeTerms.length) {
-            stop('没有可用的搜索词，无法开始');
-            return;
-        }
-
+        // 起始话题池永远兜得住，不再需要「没有搜索词就无法开始」这条分支
         doSearch();
     }
 
@@ -1357,6 +1460,11 @@
     function restore(saved) {
         state.progress = Object.assign(state.progress, saved.progress || {});
         state.usedTerms = new Set(saved.usedTerms || []);   // v1 在这里被清空，导致重复搜索
+        state.recentTerms = saved.recentTerms || [];
+        state.usedTopics = new Set(saved.usedTopics || []);
+        state.currentTopic = saved.currentTopic || '';
+        state.walkSteps = saved.walkSteps || 0;
+        state.walkLimit = saved.walkLimit || 0;
         state.clickedOffers = new Set(saved.clickedOffers || []);
         state.searchCount = saved.searchCount || 0;
         state.day = saved.day || today();
