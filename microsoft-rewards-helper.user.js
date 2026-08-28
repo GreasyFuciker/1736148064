@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.2.0
-// @description  Bing Rewards 助手：读取每日任务与搜索进度、抓取相关搜索词、以可配置的人类节奏执行搜索，并在页面跳转之间完整保持状态
+// @version      2.3.0
+// @description  Bing Rewards 助手：按设定的检索次数执行搜索，抓取相关搜索词与每日任务，以可配置的人类节奏运行，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
@@ -21,7 +21,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.2.0';
+    const VERSION = '2.3.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -96,25 +96,23 @@
     // ==========================================================================
 
     const config = {
-        restTime: 5 * 60,          // 连续无进度时的休息时长（秒）
+        restTime: 5 * 60,          // 休息一次的时长（秒）
         scrollTime: 10,            // 每次搜索后的滚动时长（秒）
         waitTime: 8,               // 滚动结束后的停留时长（秒），让 Bing 记账
         searchInterval: [12, 25],  // 两次搜索之间的随机间隔（秒）
-        maxNoProgressCount: 3,     // 连续多少次无进度才休息
-        pointsPerSearch: 3,        // 单次搜索的积分，仅用于估算“还需搜几次”
-        targetSearches: 40,        // 每天检索多少次。这是主要的终止条件，不依赖能否读到进度
+        restEvery: 12,             // 每搜索多少次休息一次，0 表示不休息
+        targetSearches: 40,        // 每天检索多少次。这是唯一的终止条件
         jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
         walkLength: [5, 8],        // 每个话题连续走几步后换新话题
         seedTopics: [...SEED_TOPICS], // 起始话题池，可在面板里编辑
         autoClickDailyTasks: true  // 自动点击未完成的每日奖励卡片
     };
 
-    /** 运行期状态。progress 与 usedTerms 会跨页面跳转持久化。 */
+    /** 运行期状态。searchCount 与 usedTerms 会跨页面跳转持久化。 */
     const state = {
         running: false,
         phase: Phase.IDLE,
         phaseUntil: 0,             // 当前阶段的结束时间戳，跳转后据此续算
-        progress: { current: 0, total: 0, completed: false, noProgressCount: 0, known: false },
         usedTerms: new Set(),      // 本日已搜过的词，跨跳转保留
         recentTerms: [],           // 最近搜过的几个词，用于近似判重
         usedTopics: new Set(),     // 本日已用过的起始话题
@@ -122,7 +120,7 @@
         walkSteps: 0,              // 当前话题已走的步数
         walkLimit: 0,              // 本话题这次要走的步数（随机 walkLength）
         clickedOffers: new Set(),  // 本日已点过的奖励卡片链接
-        searchCount: 0,            // 本日已发起的搜索次数（安全上限用）
+        searchCount: 0,            // 本日已发起的搜索次数，唯一的终止依据
         day: today(),
         mainTerms: [],
         iframeTerms: [],
@@ -134,9 +132,6 @@
 
     /** 每次调用 stop() 递增，正在 await 的阶段发现 token 变了就自我了断。 */
     let runToken = 0;
-
-    /** 本轮是否已经结算过“进度有没有涨”，见 applyProgress。 */
-    let cycleScored = false;
 
     function today() {
         const d = new Date();
@@ -169,8 +164,7 @@
         if (num(saved.restTime, 60, 3600)) config.restTime = saved.restTime;
         if (num(saved.scrollTime, 3, 60)) config.scrollTime = saved.scrollTime;
         if (num(saved.waitTime, 0, 60)) config.waitTime = saved.waitTime;
-        if (num(saved.maxNoProgressCount, 1, 10)) config.maxNoProgressCount = saved.maxNoProgressCount;
-        if (num(saved.pointsPerSearch, 1, 10)) config.pointsPerSearch = saved.pointsPerSearch;
+        if (num(saved.restEvery, 0, 100)) config.restEvery = saved.restEvery;
         if (num(saved.targetSearches, 1, 200)) config.targetSearches = saved.targetSearches;
         if (num(saved.jitterPercent, 0, 60)) config.jitterPercent = saved.jitterPercent;
         if (Array.isArray(saved.walkLength) && saved.walkLength.length === 2 &&
@@ -210,7 +204,6 @@
             running: true,
             phase: state.phase,
             phaseUntil: state.phaseUntil,
-            progress: state.progress,
             usedTerms: [...state.usedTerms],
             recentTerms: state.recentTerms,
             usedTopics: [...state.usedTopics],
@@ -301,11 +294,10 @@
     // ==========================================================================
     // 2. 网络拦截
     // ==========================================================================
-    // 奖励侧栏是跨域 iframe 时读不到 DOM，只能从 API 响应里捞数据。
-    // v1 对站内每个请求都做 clone().text()，且用 /(\d+)\/(\d+)/ 匹配任意响应，
-    // 日期 "10/25"、版本号之类都会被误判成进度。这里按 URL 收窄，并且只认结构化字段。
+    // 奖励侧栏是跨域 iframe 时读不到 DOM，只能从 API 响应里捞每日任务的完成状态。
+    // v1 对站内每个请求都做 clone().text()，这里按 URL 收窄，只解析 Rewards 相关响应。
 
-    const intercepted = { progress: null, dailyTasks: [] };
+    const intercepted = { dailyTasks: [] };
 
     function installInterceptors() {
         const originalFetch = window.fetch;
@@ -356,19 +348,6 @@
 
     function parseRewardsResponse(url, text) {
         if (!text || text.length < 32) return;
-
-        // 只接受带有明确字段名的进度，不再对任意 "a/b" 做猜测
-        const m = text.match(/"pointProgress"\s*:\s*(\d+)[\s\S]{0,120}?"pointProgressMax"\s*:\s*(\d+)/) ||
-                  text.match(/"current"\s*:\s*(\d+)\s*,\s*"total"\s*:\s*(\d+)/);
-        if (m) {
-            const current = parseInt(m[1], 10);
-            const total = parseInt(m[2], 10);
-            if (total > 0 && current <= total) {
-                intercepted.progress = { current, total };
-                log('从 API 捕获进度:', current, '/', total);
-                applyProgress(current, total, 'API');
-            }
-        }
 
         if (/"offers?"/i.test(text) && /complete/i.test(text)) {
             const tasks = [];
@@ -445,7 +424,7 @@
         { id: 'cfg-rest', label: '休息时间(分)', min: 1, max: 60, get: () => config.restTime / 60, set: v => { config.restTime = v * 60; }, unit: '分钟' },
         { id: 'cfg-scroll', label: '滚动时间(秒)', min: 3, max: 60, get: () => config.scrollTime, set: v => { config.scrollTime = v; }, unit: '秒' },
         { id: 'cfg-settle', label: '停留时间(秒)', min: 0, max: 60, get: () => config.waitTime, set: v => { config.waitTime = v; }, unit: '秒' },
-        { id: 'cfg-tolerance', label: '容错次数', min: 1, max: 10, get: () => config.maxNoProgressCount, set: v => { config.maxNoProgressCount = v; }, unit: '次' },
+        { id: 'cfg-rest-every', label: '休息间隔(次)', min: 0, max: 100, get: () => config.restEvery, set: v => { config.restEvery = v; }, unit: '次' },
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
         { id: 'cfg-imax', label: '间隔上限(秒)', min: 1, max: 600, get: () => config.searchInterval[1], set: v => { config.searchInterval[1] = Math.max(v, config.searchInterval[0]); }, unit: '秒' },
         { id: 'cfg-target', label: '检索次数', min: 1, max: 200, get: () => config.targetSearches, set: v => { config.targetSearches = v; }, unit: '次' },
@@ -511,7 +490,7 @@
                 el('div', {
                     css: 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:6px;',
                     children: [
-                        el('div', { id: 'rewards-progress', text: '进度: 加载中...', css: 'font-weight:bold;font-size:12px;' }),
+                        el('div', { id: 'rewards-progress', text: '检索: 0/0 次', css: 'font-weight:bold;font-size:12px;' }),
                         el('div', { id: 'countdown', css: `font-size:11px;color:${t.accent};font-weight:bold;` })
                     ]
                 }),
@@ -755,18 +734,16 @@
     }
 
     /**
-     * 进度显示一律以「已检索次数 / 目标次数」为准——这是脚本真正的终止条件，
+     * 进度显示一律以「已检索次数 / 目标次数」为准——这是脚本唯一的终止条件，
      * 任何时候都拿得到，不会再出现「进度: 未知」。
-     * 侧栏里的积分进度只作为附加信息，读到了才显示。
+     * 侧栏里的积分进度不再读取：那个数字经常读错，还会误判成「已拿满」提前收工。
      */
     function renderProgress() {
         const done = state.searchCount;
         const target = config.targetSearches;
-        const p = state.progress;
 
         let text = `检索: ${done}/${target} 次`;
         if (done >= target) text += ' (已完成)';
-        if (p.known) text += ` · 积分 ${p.current}/${p.total}`;
         setText('rewards-progress', text);
 
         const bar = $('rewards-progress-bar');
@@ -866,11 +843,7 @@
                   text-align:center;font-size:16px;`,
             children: [
                 el('div', { text: '任务完成！', css: 'font-weight:bold;margin-bottom:10px;font-size:18px;' }),
-                el('div', {
-                    text: state.progress.known
-                        ? `已检索 ${state.searchCount} 次 · 积分 ${state.progress.current}/${state.progress.total}`
-                        : `已检索 ${state.searchCount} 次`
-                })
+                el('div', { text: `已检索 ${state.searchCount} 次` })
             ]
         });
         el('button', {
@@ -932,32 +905,6 @@
         return false;
     }
 
-    /** 统一的进度写入口，负责判断“是否有增长”“是否完成”，并刷新 UI。 */
-    function applyProgress(current, total, source) {
-        const p = state.progress;
-        if (!(total > 0) || current < 0 || current > total) return;
-
-        // 一轮循环里可能多次读到进度（DOM + API 拦截），只允许结算一次，
-        // 否则读取失败重试会把 noProgressCount 一次性推过阈值，误触发休息。
-        if (p.known && state.running && !cycleScored) {
-            cycleScored = true;
-            if (current > p.current) {
-                p.noProgressCount = 0;
-                log(`进度增加: ${p.current} → ${current}（来源:${source}）`);
-            } else {
-                p.noProgressCount++;
-                log(`进度未增加(${current})，连续 ${p.noProgressCount} 次`);
-            }
-        }
-
-        p.current = current;
-        p.total = total;
-        p.known = true;
-        p.completed = current >= total;
-        renderProgress();
-        saveSession();
-    }
-
     /**
      * 读取侧栏 iframe。返回 true 表示至少拿到了一类数据。
      * 跨域时退回到网络拦截捕获的数据。
@@ -980,56 +927,14 @@
 
         let ok = false;
         ok = readDailyTasks(doc) || ok;
-        ok = readProgress(doc) || ok;
         ok = readSidebarTerms(iframe, doc) || ok;
         return ok || useInterceptedData();
     }
 
     function useInterceptedData() {
-        let ok = false;
-        if (intercepted.progress) {
-            applyProgress(intercepted.progress.current, intercepted.progress.total, 'API');
-            ok = true;
-        }
-        if (intercepted.dailyTasks.length) {
-            renderDailyTasks(intercepted.dailyTasks);
-            ok = true;
-        }
-        return ok;
-    }
-
-    function readProgress(doc) {
-        // 1) 常规进度行
-        const row = doc.querySelector('.daily_search_row span:last-child');
-        const m = row && row.textContent.match(/(\d+)\s*\/\s*(\d+)/);
-        if (m) {
-            applyProgress(parseInt(m[1], 10), parseInt(m[2], 10), 'DOM');
-            return true;
-        }
-
-        // 2) 文案兜底
-        const body = doc.body ? doc.body.textContent : '';
-        if (!body) return false;
-
-        const patterns = [
-            { cur: /你已获得\s*(\d+)\s*积分/, max: /最多\s*(\d+)\s*(?:奖励)?积分/ },
-            { cur: /You earned\s*(\d+)\s*points?/i, max: /(?:earn|get)\s+up\s+to\s*(\d+)\s*(?:Rewards\s+)?points?/i }
-        ];
-        for (const { cur, max } of patterns) {
-            const c = body.match(cur);
-            const t = body.match(max);
-            if (c && t) {
-                applyProgress(parseInt(c[1], 10), parseInt(t[1], 10), '文案');
-                return true;
-            }
-            if (c && !t) {
-                // 只有“你已获得 N 积分”而没有“最多”，说明当天已拿满
-                const n = parseInt(c[1], 10);
-                applyProgress(n, n, '文案-完成');
-                return true;
-            }
-        }
-        return false;
+        if (!intercepted.dailyTasks.length) return false;
+        renderDailyTasks(intercepted.dailyTasks);
+        return true;
     }
 
     function readDailyTasks(doc) {
@@ -1366,8 +1271,8 @@
     }
 
     async function checkPhase() {
-        // 侧栏读不到并不影响主流程（终止条件是检索次数），所以连续失败 3 次后
-        // 就别再每轮白等 6 秒了。
+        // 侧栏只用来显示每日任务和补充搜索词，读不到完全不影响主流程，
+        // 所以连续失败 3 次后就别再每轮白等 6 秒了。
         if (state.sidebarFailures >= 3) return false;
 
         setStatus('检查奖励面板...');
@@ -1388,7 +1293,7 @@
         state.sidebarFailures++;
         log('本轮未能读到侧栏数据（第 ' + state.sidebarFailures + ' 次）');
         if (state.sidebarFailures >= 3) {
-            setStatus('读不到奖励面板，后续不再尝试；按检索次数继续');
+            setStatus('读不到奖励面板，后续不再尝试；不影响按次数检索');
         }
         return false;
     }
@@ -1442,7 +1347,6 @@
 
     /** 一次完整循环，运行在「上一次搜索跳转后的新页面」上，最后以一次跳转结束。 */
     async function runCycle(savedPhase) {
-        cycleScored = false;
         try {
             if (savedPhase) await resumePhase(savedPhase);
 
@@ -1455,28 +1359,23 @@
                 }
                 await checkPhase();
             } else {
-                // 不在结果页（比如首页）就别装浏览了，直接查一次进度
+                // 不在结果页（比如首页）就别装浏览了，直接读一次奖励面板
                 await checkPhase();
             }
 
-            // 主终止条件：检索够 targetSearches 次。不依赖能否读到进度。
+            // 唯一的终止条件：检索够 targetSearches 次。
             if (state.searchCount >= config.targetSearches) {
                 showCompletionNotification();
                 stop(`已完成 ${state.searchCount} 次检索 🎉`);
                 return;
             }
 
-            // 附加提前结束：真读到了进度且已拿满，就没必要继续搜下去
-            if (state.progress.known && state.progress.completed) {
-                showCompletionNotification();
-                stop(`积分已拿满，共检索 ${state.searchCount} 次 🎉`);
-                return;
-            }
-
-            if (state.progress.noProgressCount >= config.maxNoProgressCount) {
-                state.progress.noProgressCount = 0;
+            // 每搜够 restEvery 次歇一会儿。以前这个休息由「进度没涨」触发，
+            // 但那个判断依赖积分读数，读错就乱歇，现在直接按次数来。
+            if (config.restEvery > 0 && state.searchCount > 0 &&
+                state.searchCount % config.restEvery === 0) {
                 const rest = humanize(config.restTime);
-                setStatus(`连续 ${config.maxNoProgressCount} 次无进度，休息 ${Math.round(rest / 60 * 10) / 10} 分钟`);
+                setStatus(`已连续检索 ${state.searchCount} 次，休息 ${Math.round(rest / 60 * 10) / 10} 分钟`);
                 await waitSeconds(rest, Phase.REST);
             }
 
@@ -1505,13 +1404,9 @@
     async function start() {
         // 用户主动点了开始，说明他知道自己在做什么，解除刷新保护
         clearLoopGuard();
-        // 启动时的这次读取发生在任何搜索之前，不能算作“搜索了却没涨分”，
-        // 否则连点几次开始就会被误判成需要休息。
-        cycleScored = true;
         state.running = true;
         state.day = today();
         state.phase = Phase.IDLE;
-        state.progress.noProgressCount = 0;
         setButtonRunning(true);
         setStatus('启动中，正在读取奖励数据...');
         saveSession();
@@ -1529,11 +1424,6 @@
             stop(`今日已检索 ${state.searchCount} 次，达到设定次数`);
             return;
         }
-        if (state.progress.known && state.progress.completed) {
-            showCompletionNotification();
-            stop('积分已拿满，无需再搜');
-            return;
-        }
 
         // 起始话题池永远兜得住，不再需要「没有搜索词就无法开始」这条分支
         doSearch();
@@ -1545,7 +1435,6 @@
         state.running = false;
         state.phase = Phase.IDLE;
         state.phaseUntil = 0;
-        state.progress.noProgressCount = 0;
         updateCountdown(0);
         clearSession();
         setButtonRunning(false);
@@ -1573,7 +1462,6 @@
     }
 
     function restore(saved) {
-        state.progress = Object.assign(state.progress, saved.progress || {});
         state.usedTerms = new Set(saved.usedTerms || []);   // v1 在这里被清空，导致重复搜索
         state.recentTerms = saved.recentTerms || [];
         state.usedTopics = new Set(saved.usedTopics || []);
@@ -1622,7 +1510,7 @@
             // 是普通导航链接，点下去就跳转，重载后又点——首页会一直刷新。
             setTimeout(() => {
                 readMainPageTerms();
-                setStatus(readSidebar() ? '就绪' : '就绪（点开积分面板可显示今日进度）');
+                setStatus(readSidebar() ? '就绪' : '就绪（点开积分面板可显示每日任务）');
             }, 1200);
         }
 
