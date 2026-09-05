@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.5.0
+// @version      2.6.0
 // @description  Bing Rewards 助手：按设定的检索次数执行搜索，每次搜索后在新标签页打开首条结果、滚动浏览再关掉，抓取相关搜索词与每日任务，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
@@ -9,6 +9,8 @@
 // @match        *://*/*
 // @run-at       document-idle
 // @grant        GM_openInTab
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @grant        unsafeWindow
 // @noframes
 // ==/UserScript==
@@ -34,7 +36,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.5.0';
+    const VERSION = '2.6.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -82,8 +84,20 @@
      * 结果页自己关不掉时，主标签页过了截止时间再等这么久就动手关。
      * 扩展开出来的标签页在 Chrome 里根本不许自己 window.close()（「脚本只能关闭自己
      * 打开的窗口」），所以主标签页才是真正负责收尾的那一方，这里不必等太久。
+     * 过了这个点还没有任何页面认领访问票据，就说明那边压根没跑起脚本，不必再等。
      */
     const VISIT_GRACE = 2 * 1000;
+    /** 结果页加载得慢、认领得晚时，最多再宽限这么久让它把浏览做完。 */
+    const VISIT_LATE_ALLOWANCE = 6 * 1000;
+    /** 结果页至少浏览这么久。加载太慢导致截止时间已过时，也不能开了就关。 */
+    const VISIT_MIN_BROWSE = 3 * 1000;
+    /**
+     * 访问票据存在 GM 存储里（按脚本存，跨域也读得到），用来告诉被打开的那一页
+     * 「你是脚本开的、浏览到什么时候」——hash 标记在跳转里丢掉时就靠它。
+     */
+    const VISIT_TICKET_KEY = 'visit_ticket';
+    /** 票据写下多久之内可以被认领。超时就当过期，免得误伤用户自己开的标签页。 */
+    const VISIT_CLAIM_WINDOW = 20 * 1000;
 
     /**
      * 起始话题池：彼此不相关，横跨天气/交通/美食/体育/硬件/教育/宠物/财经/
@@ -141,6 +155,7 @@
         jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
         walkLength: [5, 8],        // 每个话题连续走几步后换新话题
         seedTopics: [...SEED_TOPICS], // 起始话题池，可在面板里编辑
+        serpScrollTime: 5,         // 打开首条结果之前，先在结果页上滚动多久（秒），0 表示不滚
         visitFirstResult: true,    // 搜索后在新标签页打开首条结果，滚动浏览再关掉
         autoClickDailyTasks: true  // 自动点击未完成的每日奖励卡片
     };
@@ -200,6 +215,7 @@
         const num = (v, min, max) => (typeof v === 'number' && v >= min && v <= max);
         if (num(saved.restTime, 60, 3600)) config.restTime = saved.restTime;
         if (num(saved.scrollTime, 3, 60)) config.scrollTime = saved.scrollTime;
+        if (num(saved.serpScrollTime, 0, 60)) config.serpScrollTime = saved.serpScrollTime;
         if (num(saved.waitTime, 0, 60)) config.waitTime = saved.waitTime;
         if (num(saved.restEvery, 0, 100)) config.restEvery = saved.restEvery;
         if (num(saved.targetSearches, 1, 200)) config.targetSearches = saved.targetSearches;
@@ -471,6 +487,7 @@
     const CONFIG_FIELDS = [
         { id: 'cfg-rest', label: '休息时间(分)', min: 1, max: 60, get: () => config.restTime / 60, set: v => { config.restTime = v * 60; }, unit: '分钟' },
         { id: 'cfg-scroll', label: '浏览时长(秒)', min: 3, max: 60, get: () => config.scrollTime, set: v => { config.scrollTime = v; }, unit: '秒' },
+        { id: 'cfg-serp', label: '结果页滚动(秒)', min: 0, max: 60, get: () => config.serpScrollTime, set: v => { config.serpScrollTime = v; }, unit: '秒' },
         { id: 'cfg-settle', label: '停留时间(秒)', min: 0, max: 60, get: () => config.waitTime, set: v => { config.waitTime = v; }, unit: '秒' },
         { id: 'cfg-rest-every', label: '休息间隔(次)', min: 0, max: 100, get: () => config.restEvery, set: v => { config.restEvery = v; }, unit: '次' },
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
@@ -1194,6 +1211,89 @@
         return !BING_HOST_RE.test(url.hostname) || /^\/ck\//i.test(url.pathname);
     }
 
+    /**
+     * GM 存储是按脚本存的，跨域也读得到，正好用来在两个标签页之间传递访问票据。
+     * 脚本管理器没提供这两个 API 时全部退化成空操作，只是少了一条兜底路径。
+     */
+    function gmGet(key, fallback) {
+        try {
+            return (typeof GM_getValue === 'function') ? GM_getValue(key, fallback) : fallback;
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function gmSet(key, value) {
+        try {
+            if (typeof GM_setValue === 'function') GM_setValue(key, value);
+        } catch (e) { /* 忽略 */ }
+    }
+
+    function readVisitTicket() {
+        const ticket = gmGet(VISIT_TICKET_KEY, null);
+        return (ticket && typeof ticket === 'object' && ticket.deadline) ? ticket : null;
+    }
+
+    function writeVisitTicket(ticket) {
+        gmSet(VISIT_TICKET_KEY, ticket);
+    }
+
+    function clearVisitTicket() {
+        gmSet(VISIT_TICKET_KEY, null);
+    }
+
+    /** 认领票据（只能认领一次），返回浏览的截止时间；不该认领就返回 0。 */
+    function claimVisitTicket() {
+        const ticket = readVisitTicket();
+        if (!ticket || ticket.claimedAt) return 0;
+        const now = Date.now();
+        if (now >= ticket.deadline || now - (ticket.createdAt || 0) > VISIT_CLAIM_WINDOW) return 0;
+        // 只有「跟票据上写的是同一个站」或者「从 Bing 跳过来的」才可能是脚本开的那一页。
+        // 这一层是为了绝不误伤用户自己开的标签页——认错了就等于把人家的页面关掉。
+        if (hostOf(location.href) !== ticket.host && !BING_HOST_RE.test(referrerHost())) return 0;
+        ticket.claimedAt = now;
+        writeVisitTicket(ticket);
+        return ticket.deadline;
+    }
+
+    /** 带 hash 标记进来的页面：把票据一并收走，免得别的标签页再认领。 */
+    function markVisitClaimed() {
+        const ticket = readVisitTicket();
+        if (!ticket || ticket.claimedAt) return;
+        ticket.claimedAt = Date.now();
+        writeVisitTicket(ticket);
+    }
+
+    /** 浏览完了记一笔，主标签页看到就可以马上收尾，不用干等到宽限时间用完。 */
+    function markVisitDone() {
+        const ticket = readVisitTicket();
+        if (!ticket) return;
+        ticket.doneAt = Date.now();
+        if (!ticket.claimedAt) ticket.claimedAt = ticket.doneAt;
+        writeVisitTicket(ticket);
+    }
+
+    /**
+     * Bing 结果链接常常是 /ck/a 这种点击跳转，跳转时会把 URL 里的 hash 吃掉。
+     * 目标地址就编码在 u=a1<base64url> 里，能解就直接打开真实地址，
+     * 既保住了标记，也少一次跳转。解不出来就原样返回。
+     */
+    function resolveResultUrl(href) {
+        try {
+            const url = new URL(href, location.href);
+            if (!BING_HOST_RE.test(url.hostname) || !/^\/ck\//i.test(url.pathname)) return href;
+            const raw = url.searchParams.get('u') || '';
+            if (!/^a1./.test(raw)) return href;
+            const base64 = raw.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+            const padded = base64 + '='.repeat((4 - base64.length % 4) % 4);
+            const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+            const target = new TextDecoder().decode(bytes);
+            return /^https?:\/\//i.test(target) ? target : href;
+        } catch (e) {
+            return href;
+        }
+    }
+
     /** 把「浏览到什么时候」写进 hash，结果页据此知道自己是脚本打开的。 */
     function withVisitMarker(href, deadline) {
         try {
@@ -1400,20 +1500,93 @@
     }
 
     /**
-     * 断续的人工滚动，返回一个停止函数。
-     * 结果页（访问模式）和 Bing 页面（兜底滚动）共用这一份。
+     * 断续的人工滚动，返回一个停止函数。结果页和 Bing 页面共用这一份。
+     *
+     * 站外的落地页什么样都有：不少站点把滚动条放在自己的容器上，
+     * document 本身根本不滚，这时 window.scrollBy 调了也白调。所以这里每滚一下
+     * 都确认位置真的变了，连着两次没动就改滚页面里最大的那个可滚动容器。
      */
     function startScrolling() {
-        let timer = null;
+        let stepTimer = null;
+        let checkTimer = null;
+        // 文档本身就不能滚的（常见于自带滚动容器的站点），一上来就去找容器
+        let target = documentScrollable() ? null : findScrollBox();
+        let switched = target !== null;
+        let stalled = 0;
+        let lastPos = scrollPosOf(target);
+
         // 每次滚动的间隔也随机（600~1600ms）。固定 1000ms 的节拍太规律，
         // 真人的滚动是断续的：看一段、停一下、再滚。
         const step = () => {
             const amount = 100 + Math.floor(Math.random() * 300);
-            window.scrollBy({ top: Math.random() > 0.3 ? amount : -amount, behavior: 'smooth' });
-            timer = setTimeout(step, 600 + Math.floor(Math.random() * 1000));
+            const down = Math.random() > 0.3;
+            scrollTargetBy(target, down ? amount : -amount);
+
+            clearTimeout(checkTimer);
+            checkTimer = setTimeout(() => {
+                const now = scrollPosOf(target);
+                // 只看向下滚：已经在顶端时向上滚本来就不会动，不算滚不动
+                if (down && !atBottomOf(target) && Math.abs(now - lastPos) < 2) stalled++;
+                else stalled = 0;
+                lastPos = now;
+                if (stalled >= 2 && !switched) {
+                    switched = true;
+                    stalled = 0;
+                    target = findScrollBox();
+                    lastPos = scrollPosOf(target);
+                    log(target ? '窗口滚不动，改滚页面里的容器' : '这个页面没有可滚动的区域');
+                }
+            }, 400);
+
+            stepTimer = setTimeout(step, 600 + Math.floor(Math.random() * 1000));
         };
-        timer = setTimeout(step, 300 + Math.floor(Math.random() * 700));
-        return () => clearTimeout(timer);
+
+        stepTimer = setTimeout(step, 300 + Math.floor(Math.random() * 700));
+        return () => {
+            clearTimeout(stepTimer);
+            clearTimeout(checkTimer);
+        };
+    }
+
+    function documentScrollable() {
+        const doc = document.documentElement;
+        return !!doc && (doc.scrollHeight - (pageWindow.innerHeight || 0)) > 50;
+    }
+
+    function scrollPosOf(target) {
+        if (target) return target.scrollTop;
+        return pageWindow.scrollY || (document.documentElement && document.documentElement.scrollTop) || 0;
+    }
+
+    function atBottomOf(target) {
+        if (target) return target.scrollTop + target.clientHeight >= target.scrollHeight - 4;
+        const doc = document.documentElement;
+        return !doc || scrollPosOf(null) + (pageWindow.innerHeight || 0) >= doc.scrollHeight - 4;
+    }
+
+    function scrollTargetBy(target, delta) {
+        try {
+            if (target) target.scrollBy({ top: delta, behavior: 'smooth' });
+            else pageWindow.scrollBy({ top: delta, behavior: 'smooth' });
+        } catch (e) {
+            // 个别页面重写过 scrollBy，退回最朴素的写法
+            if (target) target.scrollTop += delta;
+            else pageWindow.scrollTo(0, scrollPosOf(null) + delta);
+        }
+    }
+
+    /** 页面里最大的那个能滚的容器。节点太多时只看前面一部分，别在这上面耗时间。 */
+    function findScrollBox() {
+        let best = null;
+        let seen = 0;
+        for (const node of document.querySelectorAll('div, main, section, article, ul')) {
+            if (++seen > 600) break;
+            if (node.clientHeight < 200 || node.scrollHeight - node.clientHeight < 200) continue;
+            const overflow = getComputedStyle(node).overflowY;
+            if (overflow !== 'auto' && overflow !== 'scroll') continue;
+            if (!best || node.clientHeight > best.clientHeight) best = node;
+        }
+        return best;
     }
 
     /**
@@ -1429,12 +1602,18 @@
             return scrollPhase(seconds, config.visitFirstResult ? '没找到可打开的搜索结果' : '');
         }
 
-        const href = link.href;
+        const href = resolveResultUrl(link.href);
         const label = (link.textContent || '').trim().slice(0, 24) || hostOf(href) || '首条结果';
         const deadline = Date.now() + seconds * 1000;
 
+        // 票据先写、标签页后开：那一页可能比这行代码之后的任何东西都先加载完
+        writeVisitTicket({
+            host: hostOf(href), deadline, createdAt: Date.now(), claimedAt: 0, doneAt: 0
+        });
+
         const handle = openVisitTab(withVisitMarker(href, deadline));
         if (!handle) {
+            clearVisitTicket();
             return scrollPhase(seconds, '新标签页被拦截（请允许本站弹出窗口）');
         }
 
@@ -1442,10 +1621,26 @@
         if (handle.win) installVisitBridge(handle.win, deadline);
         setStatus(`新标签页浏览首条结果 ${seconds} 秒：${label}`);
         try {
-            await waitUntil(deadline + VISIT_GRACE, Phase.VISIT, () => handle.isClosed());
+            // 收尾条件，谁先到算谁：那一页自己关了 / 说它浏览完了 /
+            // 过了宽限还没有任何页面认领票据（说明那边没跑起脚本，别再干等）。
+            await waitUntil(deadline + VISIT_LATE_ALLOWANCE, Phase.VISIT, () => {
+                if (handle.isClosed()) return true;
+                const ticket = readVisitTicket();
+                if (ticket && ticket.doneAt) return true;
+                return Date.now() > deadline + VISIT_GRACE && !(ticket && ticket.claimedAt);
+            });
+            reportVisitOutcome();
         } finally {
             closeVisitTab();
         }
+    }
+
+    /** 那一页到底有没有滚起来？没有的话说清楚，别让人对着「打开了但没动」猜。 */
+    function reportVisitOutcome() {
+        const ticket = readVisitTicket();
+        if (!ticket || ticket.claimedAt) return;
+        log('结果页没有进入访问模式：可能是站点不允许用户脚本，或者跳转把标记弄丢了');
+        setStatus('结果页没跑起脚本，本次只打开没滚动');
     }
 
     /**
@@ -1499,6 +1694,7 @@
         const handle = visitTab;
         visitTab = null;
         if (!handle) return;
+        clearVisitTicket();
         try {
             if (!handle.isClosed()) handle.close();
         } catch (e) { /* 忽略 */ }
@@ -1540,7 +1736,7 @@
     function scrollPhase(seconds, reason) {
         setStatus(reason
             ? `${reason}，改为在结果页滚动 ${seconds} 秒`
-            : `模拟浏览：滚动页面 ${seconds} 秒...`);
+            : `浏览结果页：滚动 ${seconds} 秒...`);
         if (stopScroller) stopScroller();
         stopScroller = startScrolling();
 
@@ -1641,6 +1837,8 @@
             if (savedPhase) await resumePhase(savedPhase);
 
             if (isResultsPage()) {
+                // 先在结果页上扫一眼——真人也是先看几眼结果再点进去——然后再打开首条结果
+                if (config.serpScrollTime > 0) await scrollPhase(humanize(config.serpScrollTime));
                 await visitPhase();
                 if (config.waitTime > 0) {
                     const settle = humanize(config.waitTime);
@@ -1756,23 +1954,34 @@
         return hit ? saneDeadline(hit[1]) : 0;
     }
 
-    /** 滚动到点，然后关掉自己。主标签页也会来关，两边谁先到都行。 */
+    /**
+     * 滚动到点，记一笔「浏览完了」，然后关掉自己。主标签页也会来关，两边谁先到都行。
+     * 页面加载得慢时截止时间可能已经过了，那也至少浏览 VISIT_MIN_BROWSE——
+     * 开了个标签页却一下都没滚就关掉，跟没打开是一样的。
+     */
     function runVisitMode(deadline) {
-        log('访问模式：', Math.max(0, Math.round((deadline - Date.now()) / 1000)), '秒后关闭本页');
+        const until = Math.max(deadline, Date.now() + VISIT_MIN_BROWSE);
+        log('访问模式：浏览', Math.round((until - Date.now()) / 1000), '秒后关闭本页');
         const stopScroll = startScrolling();
         const tick = () => {
-            if (Date.now() < deadline) {
+            if (Date.now() < until) {
                 setTimeout(tick, 400);
                 return;
             }
             stopScroll();
+            markVisitDone();
             // 扩展开出来的标签页不许自己关（浏览器会在控制台留一句警告），
-            // 关不掉也无所谓：主标签页过了截止时间就会来收尾。
+            // 关不掉也无所谓：主标签页看到「浏览完了」就会来收尾。
             try {
                 pageWindow.close();
             } catch (e) { /* 忽略 */ }
         };
         tick();
+    }
+
+    /** Bing 的点击跳转中转页：马上就要跳走，不滚也不认领票据，把机会留给真正的落地页。 */
+    function isBingRedirectPage() {
+        return BING_HOST_RE.test(location.hostname) && /^\/ck\//i.test(location.pathname);
     }
 
     /**
@@ -1863,15 +2072,25 @@
     }
 
     function init() {
-        // 本页是脚本打开的首条结果：滚一会儿再关掉自己，别的什么都不做
-        const deadline = visitDeadlineFromHash();
-        if (deadline) {
-            runVisitMode(deadline);
+        // Bing 的点击跳转中转页：等它跳到真正的落地页再说
+        if (isBingRedirectPage()) return;
+
+        // 本页带着脚本写的标记，就是被打开的首条结果：滚一会儿再关掉自己，别的都不做
+        const marked = visitDeadlineFromHash();
+        if (marked) {
+            markVisitClaimed();
+            runVisitMode(marked);
             return;
         }
+
         if (!isHelperPage()) {
-            // 其它站点（以及 Bing 的 /ck/a 中转页）只可能是被打开的结果页，
-            // hash 丢了就问一下打开自己的窗口；不是脚本开的就到此为止。
+            // 标记在跳转里丢了的兜底：认领主标签页刚写下的访问票据（GM 存储跨域可读）。
+            // 认不到就再问一次打开自己的窗口（window.open 那条路才有 opener）。
+            const claimed = claimVisitTicket();
+            if (claimed) {
+                runVisitMode(claimed);
+                return;
+            }
             askOpenerForVisit();
             return;
         }
