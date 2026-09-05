@@ -1,28 +1,40 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.4.0
+// @version      2.5.0
 // @description  Bing Rewards 助手：按设定的检索次数执行搜索，每次搜索后在新标签页打开首条结果、滚动浏览再关掉，抓取相关搜索词与每日任务，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
 // @match        *://*/*
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_openInTab
+// @grant        unsafeWindow
 // @noframes
 // ==/UserScript==
 
 (function () {
     'use strict';
 
+    /**
+     * 页面真正的 window。
+     * 声明了 @grant 之后脚本跑在沙箱里，`window` 是一层代理：改 window.fetch 只会改到
+     * 代理上，页面里的 fetch 毫发无损；拿 `window` 直接和 `window.top` 比也会因为
+     * 「代理 !== 真身」而恒不相等。凡是要碰页面本身的地方都用这个引用。
+     */
+    const pageWindow = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+
+    /** 脚本管理器提供的开标签页 API。它由扩展开标签页，不受浏览器弹窗拦截器管。 */
+    const openInTab = (typeof GM_openInTab === 'function') ? GM_openInTab : null;
+
     // 双保险：@noframes 之外再挡一次 iframe（奖励侧栏本身就是 iframe）
-    if (window !== window.top) return;
+    if (pageWindow.top !== pageWindow) return;
 
     // ==========================================================================
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.4.0';
+    const VERSION = '2.5.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -66,8 +78,12 @@
     const VISIT_MSG = 'bing-rewards-helper/visit';
     /** 时间戳超出这个范围就当过期忽略，免得一条存下来的旧链接把页面关掉。 */
     const VISIT_MAX_MS = 10 * 60 * 1000;
-    /** 结果页没能自己关掉时（没跑起脚本、是个 PDF……），主标签页最多再等这么久就强制收尾。 */
-    const VISIT_GRACE = 8 * 1000;
+    /**
+     * 结果页自己关不掉时，主标签页过了截止时间再等这么久就动手关。
+     * 扩展开出来的标签页在 Chrome 里根本不许自己 window.close()（「脚本只能关闭自己
+     * 打开的窗口」），所以主标签页才是真正负责收尾的那一方，这里不必等太久。
+     */
+    const VISIT_GRACE = 2 * 1000;
 
     /**
      * 起始话题池：彼此不相关，横跨天气/交通/美食/体育/硬件/教育/宠物/财经/
@@ -322,9 +338,19 @@
     const intercepted = { dailyTasks: [] };
 
     function installInterceptors() {
-        const originalFetch = window.fetch;
+        try {
+            hookPageRequests();
+            log('网络拦截器已激活（仅匹配 Rewards 相关请求）');
+        } catch (e) {
+            // 拦截只影响每日任务的显示，装不上就算了，主流程照跑
+            log('网络拦截器安装失败:', e && e.message);
+        }
+    }
+
+    function hookPageRequests() {
+        const originalFetch = pageWindow.fetch;
         if (typeof originalFetch === 'function') {
-            window.fetch = function (...args) {
+            pageWindow.fetch = function (...args) {
                 const promise = originalFetch.apply(this, args);
                 const url = requestUrl(args[0]);
                 if (url && REWARDS_URL_RE.test(url)) {
@@ -336,15 +362,17 @@
             };
         }
 
-        const xhrOpen = XMLHttpRequest.prototype.open;
-        const xhrSend = XMLHttpRequest.prototype.send;
+        const xhrProto = pageWindow.XMLHttpRequest && pageWindow.XMLHttpRequest.prototype;
+        if (!xhrProto) return;
+        const xhrOpen = xhrProto.open;
+        const xhrSend = xhrProto.send;
 
-        XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        xhrProto.open = function (method, url, ...rest) {
             this.__rewardsUrl = typeof url === 'string' ? url : '';
             return xhrOpen.call(this, method, url, ...rest);
         };
 
-        XMLHttpRequest.prototype.send = function (body) {
+        xhrProto.send = function (body) {
             if (REWARDS_URL_RE.test(this.__rewardsUrl || '') && !this.__rewardsHooked) {
                 this.__rewardsHooked = true;
                 this.addEventListener('load', () => {
@@ -357,8 +385,6 @@
             }
             return xhrSend.call(this, body);
         };
-
-        log('网络拦截器已激活（仅匹配 Rewards 相关请求）');
     }
 
     function requestUrl(input) {
@@ -653,7 +679,7 @@
         });
 
         el('div', {
-            text: '需允许本站弹出窗口，被拦截时会退回在结果页滚动',
+            text: '由脚本管理器开标签页；退化到 window.open 时需允许本站弹窗',
             css: `grid-column:1/-1;font-size:10px;color:${t.textSecondary};padding-left:20px;`,
             parent: configForm
         });
@@ -1126,23 +1152,37 @@
      * 剩下的就是真人会点进去的那一条。找不到返回 null，由调用方退回原地滚动。
      */
     function findFirstResultLink() {
+        // Bing 的结果页版式换得很勤，所以从最精确的选择器一路放宽到「结果区里的第一条外链」，
+        // 而不是钉死在某一版 DOM 上。真正的过滤交给 isVisitableResult。
         const selectors = [
-            '#b_results > li.b_algo h2 > a[href]',
-            '#b_results > li.b_algo a.tilk[href]',
-            '#b_results > li.b_algo h2 a[href]',
-            '#b_results > li.b_algo a[href]'
+            '#b_results li.b_algo h2 a[href]',    // 经典版式：结果标题
+            '#b_results li.b_algo a.tilk[href]',  // 带 .b_tpcn 包装的新版式
+            '#b_results li.b_algo a[href]',       // 同一条结果里的任意外链
+            '#b_results h2 a[href]',              // 版式又变了：任意结果块的标题
+            '#b_results a[href]',                 // 兜底：结果区里的第一条外链
+            '#b_content a[href]'                  // 连 #b_results 都找不到时
         ];
         for (const selector of selectors) {
             for (const node of document.querySelectorAll(selector)) {
                 if (isVisitableResult(node)) return node;
             }
         }
+        logNoResultLink();
         return null;
+    }
+
+    /** 一条都挑不出来时，把页面上到底有什么打到控制台，方便照着调选择器。 */
+    function logNoResultLink() {
+        const items = document.querySelectorAll('#b_results li');
+        const links = document.querySelectorAll('#b_results a[href]');
+        log('没挑出可打开的结果：#b_results 里有', items.length, '个条目、', links.length, '个链接；',
+            '前 5 个 href:', [...links].slice(0, 5).map(a => a.href));
     }
 
     function isVisitableResult(node) {
         if (!node || !node.href || !node.getClientRects().length) return false;
-        if (node.closest('.b_ad, .b_adTop, .b_adBottom, .ad_sc')) return false;   // 广告不点
+        // 广告不点
+        if (node.closest('.b_ad, .b_adTop, .b_adBottom, .b_adSlug, .ad_sc, .sb_add')) return false;
         let url;
         try {
             url = new URL(node.href, location.href);
@@ -1283,7 +1323,7 @@
 
     let tickerId = null;
     let stopScroller = null;
-    let visitTab = null;      // 正在浏览的结果页标签
+    let visitTab = null;      // 正在浏览的结果页标签（openVisitTab 返回的句柄）
     let visitBridge = null;   // 回答结果页「浏览到什么时候」的 message 监听器
 
     function clearTimers() {
@@ -1386,46 +1426,84 @@
         const seconds = humanize(config.scrollTime);
         const link = config.visitFirstResult ? findFirstResultLink() : null;
         if (!link) {
-            if (config.visitFirstResult) log('结果页上没找到可打开的首条结果，改为原地滚动');
-            return scrollPhase(seconds);
+            return scrollPhase(seconds, config.visitFirstResult ? '没找到可打开的搜索结果' : '');
         }
 
         const href = link.href;
         const label = (link.textContent || '').trim().slice(0, 24) || hostOf(href) || '首条结果';
         const deadline = Date.now() + seconds * 1000;
 
-        let tab = null;
-        try {
-            tab = window.open(withVisitMarker(href, deadline), '_blank');
-        } catch (e) {
-            log('打开新标签页失败:', e.message);
-        }
-        if (!tab) {
-            setStatus('新标签页被浏览器拦截，请允许本站的弹出窗口；本次改为在结果页滚动');
-            return scrollPhase(seconds);
+        const handle = openVisitTab(withVisitMarker(href, deadline));
+        if (!handle) {
+            return scrollPhase(seconds, '新标签页被拦截（请允许本站弹出窗口）');
         }
 
-        visitTab = tab;
-        installVisitBridge(tab, deadline);
+        visitTab = handle;
+        if (handle.win) installVisitBridge(handle.win, deadline);
         setStatus(`新标签页浏览首条结果 ${seconds} 秒：${label}`);
         try {
-            await waitUntil(deadline + VISIT_GRACE, Phase.VISIT, () => tab.closed);
+            await waitUntil(deadline + VISIT_GRACE, Phase.VISIT, () => handle.isClosed());
         } finally {
             closeVisitTab();
         }
     }
 
-    /** 关掉结果页标签并回到本页。结果页已经自己关了也没关系，close() 是幂等的。 */
+    /**
+     * 开一个标签页，返回统一的句柄 { isClosed(), close(), win }。
+     *
+     * 首选 GM_openInTab：标签页由脚本管理器（扩展）打开，绕得过浏览器的弹窗拦截器——
+     * window.open 不是点击触发的，默认会被直接挡掉，这正是 v2.4.0 在实际浏览器里
+     * 总是退回原地滚动的原因。代价是这样开出来的标签页拿不到 window 句柄，也不许
+     * 自己 window.close()，所以一律由主标签页负责关。
+     * 没有这个 API（或调用失败）时退回 window.open，那条路才需要用户放行弹窗。
+     */
+    function openVisitTab(url) {
+        if (openInTab) {
+            try {
+                const tab = openInTab(url, { active: true, insert: true, setParent: true });
+                if (tab) {
+                    let closed = false;
+                    try {
+                        tab.onclose = () => { closed = true; };
+                    } catch (e) { /* 老版本没有 onclose，靠 closed 属性和超时兜底 */ }
+                    return {
+                        win: null,
+                        isClosed: () => closed || tab.closed === true,
+                        close: () => { if (typeof tab.close === 'function') tab.close(); }
+                    };
+                }
+            } catch (e) {
+                log('GM_openInTab 失败，改用 window.open:', e && e.message);
+            }
+        } else {
+            log('脚本管理器没提供 GM_openInTab，改用 window.open（可能被弹窗拦截器挡下）');
+        }
+
+        let win = null;
+        try {
+            win = pageWindow.open(url, '_blank');
+        } catch (e) {
+            log('window.open 失败:', e && e.message);
+        }
+        if (!win) return null;
+        return {
+            win,
+            isClosed: () => win.closed,
+            close: () => win.close()
+        };
+    }
+
+    /** 关掉结果页标签并回到本页。它已经自己关了也没关系，再关一次是空操作。 */
     function closeVisitTab() {
         removeVisitBridge();
-        const tab = visitTab;
+        const handle = visitTab;
         visitTab = null;
-        if (!tab) return;
+        if (!handle) return;
         try {
-            if (!tab.closed) tab.close();
+            if (!handle.isClosed()) handle.close();
         } catch (e) { /* 忽略 */ }
         try {
-            window.focus();
+            pageWindow.focus();
         } catch (e) { /* 忽略 */ }
     }
 
@@ -1445,18 +1523,24 @@
                                 /^https?:\/\//.test(event.origin) ? event.origin : '*');
             } catch (e) { /* 忽略 */ }
         };
-        window.addEventListener('message', visitBridge);
+        pageWindow.addEventListener('message', visitBridge);
     }
 
     function removeVisitBridge() {
         if (!visitBridge) return;
-        window.removeEventListener('message', visitBridge);
+        pageWindow.removeEventListener('message', visitBridge);
         visitBridge = null;
     }
 
-    /** 兜底：在当前结果页原地滚动（打不开新标签页时才会走到这里）。 */
-    function scrollPhase(seconds) {
-        setStatus(`模拟浏览：滚动页面 ${seconds} 秒...`);
+    /**
+     * 兜底：在当前结果页原地滚动（打不开新标签页时才会走到这里）。
+     * reason 会一起显示在面板上——v2.4.0 把原因单独 setStatus 一次，紧接着就被这句
+     * 盖掉了，结果用户只看到「在滚动」，看不出新标签页为什么没开。
+     */
+    function scrollPhase(seconds, reason) {
+        setStatus(reason
+            ? `${reason}，改为在结果页滚动 ${seconds} 秒`
+            : `模拟浏览：滚动页面 ${seconds} 秒...`);
         if (stopScroller) stopScroller();
         stopScroller = startScrolling();
 
@@ -1682,9 +1766,11 @@
                 return;
             }
             stopScroll();
+            // 扩展开出来的标签页不许自己关（浏览器会在控制台留一句警告），
+            // 关不掉也无所谓：主标签页过了截止时间就会来收尾。
             try {
-                window.close();
-            } catch (e) { /* 关不掉就算了，主标签页会来收尾 */ }
+                pageWindow.close();
+            } catch (e) { /* 忽略 */ }
         };
         tick();
     }
@@ -1696,7 +1782,7 @@
     function askOpenerForVisit() {
         let opener = null;
         try {
-            opener = window.opener;
+            opener = pageWindow.opener;
         } catch (e) { /* 忽略 */ }
         if (!opener || !BING_HOST_RE.test(referrerHost())) return;
 
@@ -1713,7 +1799,7 @@
         };
         const stopAsking = () => {
             clearInterval(timer);
-            window.removeEventListener('message', onMessage);
+            pageWindow.removeEventListener('message', onMessage);
         };
         const ask = () => {
             if (++tries > 10) {          // 问满 5 秒还没人应，就当自己是普通标签页
@@ -1726,7 +1812,7 @@
                 stopAsking();
             }
         };
-        window.addEventListener('message', onMessage);
+        pageWindow.addEventListener('message', onMessage);
         ask();
         timer = setInterval(ask, 500);
     }
@@ -1826,7 +1912,7 @@
             }, 1200);
         }
 
-        log(`已加载 v${VERSION}`);
+        log(`已加载 v${VERSION}（开标签页方式: ${openInTab ? 'GM_openInTab' : 'window.open'}）`);
     }
 
     if (document.readyState === 'loading') {
