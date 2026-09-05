@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.3.0
-// @description  Bing Rewards 助手：按设定的检索次数执行搜索，抓取相关搜索词与每日任务，以可配置的人类节奏运行，并在页面跳转之间完整保持状态
+// @version      2.4.0
+// @description  Bing Rewards 助手：按设定的检索次数执行搜索，每次搜索后在新标签页打开首条结果、滚动浏览再关掉，抓取相关搜索词与每日任务，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
+// @match        *://*/*
 // @run-at       document-idle
 // @grant        none
 // @noframes
@@ -21,7 +22,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.3.0';
+    const VERSION = '2.4.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -31,6 +32,7 @@
     /** 阶段名，同时作为持久化的断点标记。 */
     const Phase = {
         IDLE: 'idle',
+        VISIT: 'visiting',
         SCROLL: 'scrolling',
         SETTLE: 'waiting',
         CHECK: 'checking',
@@ -39,6 +41,7 @@
     };
 
     const PHASE_LABEL = {
+        [Phase.VISIT]: '浏览结果',
         [Phase.SCROLL]: '滚动中',
         [Phase.SETTLE]: '停留中',
         [Phase.CHECK]: '检查中',
@@ -48,6 +51,23 @@
 
     /** 只有命中这些 URL 的响应才会被解析，避免对全站所有请求做无谓的克隆与正则。 */
     const REWARDS_URL_RE = /(rewards|bingflyout|flyoutcontroller|getuserinfo|dailysetpromotions)/i;
+
+    /**
+     * 脚本要在「被打开的首条结果」那一页里滚动并自行关闭，所以 @match 放开到了全站。
+     * 但助手面板与整套搜索流程只在下面这两个域名上运行，其余站点最多进入访问模式，
+     * 确认不是脚本开的页面就立刻返回，什么都不碰（见 init）。
+     */
+    const HELPER_HOSTS = ['www.bing.com', 'cn.bing.com'];
+    const BING_HOST_RE = /(^|\.)bing\.com$/i;
+
+    /** 访问模式的标记：打开结果页时写进 hash，值是「浏览到什么时候」的时间戳。 */
+    const VISIT_HASH_KEY = 'brhVisit';
+    /** hash 在 Bing 的 /ck/a 跳转里可能丢掉，这时结果页会用它跟主标签页要时间戳。 */
+    const VISIT_MSG = 'bing-rewards-helper/visit';
+    /** 时间戳超出这个范围就当过期忽略，免得一条存下来的旧链接把页面关掉。 */
+    const VISIT_MAX_MS = 10 * 60 * 1000;
+    /** 结果页没能自己关掉时（没跑起脚本、是个 PDF……），主标签页最多再等这么久就强制收尾。 */
+    const VISIT_GRACE = 8 * 1000;
 
     /**
      * 起始话题池：彼此不相关，横跨天气/交通/美食/体育/硬件/教育/宠物/财经/
@@ -105,6 +125,7 @@
         jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
         walkLength: [5, 8],        // 每个话题连续走几步后换新话题
         seedTopics: [...SEED_TOPICS], // 起始话题池，可在面板里编辑
+        visitFirstResult: true,    // 搜索后在新标签页打开首条结果，滚动浏览再关掉
         autoClickDailyTasks: true  // 自动点击未完成的每日奖励卡片
     };
 
@@ -181,6 +202,7 @@
             saved.searchInterval[0] <= saved.searchInterval[1]) {
             config.searchInterval = saved.searchInterval.slice();
         }
+        if (typeof saved.visitFirstResult === 'boolean') config.visitFirstResult = saved.visitFirstResult;
         if (typeof saved.autoClickDailyTasks === 'boolean') config.autoClickDailyTasks = saved.autoClickDailyTasks;
     }
 
@@ -422,7 +444,7 @@
 
     const CONFIG_FIELDS = [
         { id: 'cfg-rest', label: '休息时间(分)', min: 1, max: 60, get: () => config.restTime / 60, set: v => { config.restTime = v * 60; }, unit: '分钟' },
-        { id: 'cfg-scroll', label: '滚动时间(秒)', min: 3, max: 60, get: () => config.scrollTime, set: v => { config.scrollTime = v; }, unit: '秒' },
+        { id: 'cfg-scroll', label: '浏览时长(秒)', min: 3, max: 60, get: () => config.scrollTime, set: v => { config.scrollTime = v; }, unit: '秒' },
         { id: 'cfg-settle', label: '停留时间(秒)', min: 0, max: 60, get: () => config.waitTime, set: v => { config.waitTime = v; }, unit: '秒' },
         { id: 'cfg-rest-every', label: '休息间隔(次)', min: 0, max: 100, get: () => config.restEvery, set: v => { config.restEvery = v; }, unit: '次' },
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
@@ -607,6 +629,33 @@
                     }
                 })
             ]
+        });
+
+        el('div', {
+            css: 'grid-column:1/-1;display:flex;align-items:center;gap:6px;margin-top:2px;',
+            parent: configForm,
+            children: [
+                el('input', {
+                    id: 'visit-first-result',
+                    attrs: { type: 'checkbox' },
+                    props: { checked: config.visitFirstResult },
+                    css: 'cursor:pointer;width:14px;height:14px;',
+                    on: {
+                        change: (e) => {
+                            config.visitFirstResult = e.target.checked;
+                            saveConfig();
+                            setStatus('新标签页浏览首条结果: ' + (e.target.checked ? '开启' : '关闭'));
+                        }
+                    }
+                }),
+                el('label', { text: '新标签页打开首条结果', attrs: { for: 'visit-first-result' }, css: 'cursor:pointer;font-size:11px;' })
+            ]
+        });
+
+        el('div', {
+            text: '需允许本站弹出窗口，被拦截时会退回在结果页滚动',
+            css: `grid-column:1/-1;font-size:10px;color:${t.textSecondary};padding-left:20px;`,
+            parent: configForm
         });
 
         el('div', {
@@ -1072,6 +1121,52 @@
         return null;
     }
 
+    /**
+     * 结果页上的第一条自然结果。广告块和站内入口（图片/视频/相关搜索）都排掉，
+     * 剩下的就是真人会点进去的那一条。找不到返回 null，由调用方退回原地滚动。
+     */
+    function findFirstResultLink() {
+        const selectors = [
+            '#b_results > li.b_algo h2 > a[href]',
+            '#b_results > li.b_algo a.tilk[href]',
+            '#b_results > li.b_algo h2 a[href]',
+            '#b_results > li.b_algo a[href]'
+        ];
+        for (const selector of selectors) {
+            for (const node of document.querySelectorAll(selector)) {
+                if (isVisitableResult(node)) return node;
+            }
+        }
+        return null;
+    }
+
+    function isVisitableResult(node) {
+        if (!node || !node.href || !node.getClientRects().length) return false;
+        if (node.closest('.b_ad, .b_adTop, .b_adBottom, .ad_sc')) return false;   // 广告不点
+        let url;
+        try {
+            url = new URL(node.href, location.href);
+        } catch (e) {
+            return false;
+        }
+        if (!/^https?:$/.test(url.protocol)) return false;
+        // 站内链接一律不算结果；/ck/a 例外，那是 Bing 自己的点击跳转，真人点的也是它
+        return !BING_HOST_RE.test(url.hostname) || /^\/ck\//i.test(url.pathname);
+    }
+
+    /** 把「浏览到什么时候」写进 hash，结果页据此知道自己是脚本打开的。 */
+    function withVisitMarker(href, deadline) {
+        try {
+            const url = new URL(href, location.href);
+            url.hash = url.hash
+                ? `${url.hash}&${VISIT_HASH_KEY}=${deadline}`
+                : `${VISIT_HASH_KEY}=${deadline}`;
+            return url.toString();
+        } catch (e) {
+            return href;
+        }
+    }
+
     function readMainPageTerms() {
         const current = (new URLSearchParams(location.search).get('q') || '').trim();
         const accept = (text) => text.length > 2 && text.length < 60 && text !== current;
@@ -1187,15 +1282,20 @@
     // 并把阶段与截止时间写进 localStorage，跳转/刷新都能续算。
 
     let tickerId = null;
-    let scrollerId = null;
+    let stopScroller = null;
+    let visitTab = null;      // 正在浏览的结果页标签
+    let visitBridge = null;   // 回答结果页「浏览到什么时候」的 message 监听器
 
     function clearTimers() {
         if (tickerId) { clearInterval(tickerId); tickerId = null; }
-        if (scrollerId) { clearTimeout(scrollerId); scrollerId = null; }
+        if (stopScroller) { stopScroller(); stopScroller = null; }
     }
 
-    /** 等到 deadline，期间刷新倒计时；停止搜索会以 ABORT 拒绝。 */
-    function waitUntil(deadline, phase) {
+    /**
+     * 等到 deadline，期间刷新倒计时；停止搜索会以 ABORT 拒绝。
+     * until 是可选的提前结束条件（例如结果页标签自己关掉了，就没必要再等）。
+     */
+    function waitUntil(deadline, phase, until) {
         state.phase = phase;
         state.phaseUntil = deadline;
         saveSession();
@@ -1209,6 +1309,13 @@
                     clearInterval(tickerId);
                     tickerId = null;
                     reject(ABORT);
+                    return;
+                }
+                if (until && until()) {
+                    clearInterval(tickerId);
+                    tickerId = null;
+                    updateCountdown(0);
+                    resolve();
                     return;
                 }
                 const left = Math.ceil((deadline - Date.now()) / 1000);
@@ -1242,6 +1349,8 @@
 
     /** 恢复被跳转打断的阶段：剩余时间大于 0 就接着等，否则立即跳过。 */
     function resumePhase(saved) {
+        // 访问模式的标签页跟着上一个页面一起没了，没什么可续的，直接往下走
+        if (saved.phase === Phase.VISIT) return Promise.resolve();
         const remain = (saved.phaseUntil || 0) - Date.now();
         if (remain > 1000 && PHASE_LABEL[saved.phase]) {
             setStatus(`恢复上次的${PHASE_LABEL[saved.phase]}（剩余 ${Math.ceil(remain / 1000)} 秒）`);
@@ -1250,24 +1359,121 @@
         return Promise.resolve();
     }
 
-    function scrollPhase() {
-        const seconds = humanize(config.scrollTime);
-        setStatus(`模拟浏览：滚动页面 ${seconds} 秒...`);
-        clearTimeout(scrollerId);
-
+    /**
+     * 断续的人工滚动，返回一个停止函数。
+     * 结果页（访问模式）和 Bing 页面（兜底滚动）共用这一份。
+     */
+    function startScrolling() {
+        let timer = null;
         // 每次滚动的间隔也随机（600~1600ms）。固定 1000ms 的节拍太规律，
         // 真人的滚动是断续的：看一段、停一下、再滚。
         const step = () => {
             const amount = 100 + Math.floor(Math.random() * 300);
             window.scrollBy({ top: Math.random() > 0.3 ? amount : -amount, behavior: 'smooth' });
-            scrollerId = setTimeout(step, 600 + Math.floor(Math.random() * 1000));
+            timer = setTimeout(step, 600 + Math.floor(Math.random() * 1000));
         };
-        scrollerId = setTimeout(step, 300 + Math.floor(Math.random() * 700));
+        timer = setTimeout(step, 300 + Math.floor(Math.random() * 700));
+        return () => clearTimeout(timer);
+    }
+
+    /**
+     * 搜索之后的浏览：新标签页打开首条结果，在那边滚动，到点关掉标签页回到本页。
+     * 结果页会自己数着时间关掉自己，主标签页只是兜底——多等 VISIT_GRACE 后强制关，
+     * 所以哪怕结果页根本没跑起脚本（CSP、PDF、跳转丢了 hash），流程也不会卡住。
+     * 没有可打开的结果、或者弹窗被浏览器拦下来，就退回原来的做法：在结果页滚动。
+     */
+    async function visitPhase() {
+        const seconds = humanize(config.scrollTime);
+        const link = config.visitFirstResult ? findFirstResultLink() : null;
+        if (!link) {
+            if (config.visitFirstResult) log('结果页上没找到可打开的首条结果，改为原地滚动');
+            return scrollPhase(seconds);
+        }
+
+        const href = link.href;
+        const label = (link.textContent || '').trim().slice(0, 24) || hostOf(href) || '首条结果';
+        const deadline = Date.now() + seconds * 1000;
+
+        let tab = null;
+        try {
+            tab = window.open(withVisitMarker(href, deadline), '_blank');
+        } catch (e) {
+            log('打开新标签页失败:', e.message);
+        }
+        if (!tab) {
+            setStatus('新标签页被浏览器拦截，请允许本站的弹出窗口；本次改为在结果页滚动');
+            return scrollPhase(seconds);
+        }
+
+        visitTab = tab;
+        installVisitBridge(tab, deadline);
+        setStatus(`新标签页浏览首条结果 ${seconds} 秒：${label}`);
+        try {
+            await waitUntil(deadline + VISIT_GRACE, Phase.VISIT, () => tab.closed);
+        } finally {
+            closeVisitTab();
+        }
+    }
+
+    /** 关掉结果页标签并回到本页。结果页已经自己关了也没关系，close() 是幂等的。 */
+    function closeVisitTab() {
+        removeVisitBridge();
+        const tab = visitTab;
+        visitTab = null;
+        if (!tab) return;
+        try {
+            if (!tab.closed) tab.close();
+        } catch (e) { /* 忽略 */ }
+        try {
+            window.focus();
+        } catch (e) { /* 忽略 */ }
+    }
+
+    /**
+     * hash 有时会在 Bing 的 /ck/a 跳转里丢掉，结果页因此还会朝打开它的窗口喊一声，
+     * 这里负责回答「浏览到什么时候」。只认自己 window.open 出来的那个窗口，
+     * 别的窗口发来的消息一律不理。
+     */
+    function installVisitBridge(tab, deadline) {
+        removeVisitBridge();
+        visitBridge = (event) => {
+            if (event.source !== tab) return;
+            const data = event.data;
+            if (!data || data.type !== VISIT_MSG || data.role !== 'hello') return;
+            try {
+                tab.postMessage({ type: VISIT_MSG, role: 'visit', deadline },
+                                /^https?:\/\//.test(event.origin) ? event.origin : '*');
+            } catch (e) { /* 忽略 */ }
+        };
+        window.addEventListener('message', visitBridge);
+    }
+
+    function removeVisitBridge() {
+        if (!visitBridge) return;
+        window.removeEventListener('message', visitBridge);
+        visitBridge = null;
+    }
+
+    /** 兜底：在当前结果页原地滚动（打不开新标签页时才会走到这里）。 */
+    function scrollPhase(seconds) {
+        setStatus(`模拟浏览：滚动页面 ${seconds} 秒...`);
+        if (stopScroller) stopScroller();
+        stopScroller = startScrolling();
 
         return waitSeconds(seconds, Phase.SCROLL).finally(() => {
-            clearTimeout(scrollerId);
-            scrollerId = null;
+            if (stopScroller) {
+                stopScroller();
+                stopScroller = null;
+            }
         });
+    }
+
+    function hostOf(href) {
+        try {
+            return new URL(href, location.href).hostname.replace(/^www\./, '');
+        } catch (e) {
+            return '';
+        }
     }
 
     async function checkPhase() {
@@ -1351,7 +1557,7 @@
             if (savedPhase) await resumePhase(savedPhase);
 
             if (isResultsPage()) {
-                await scrollPhase();
+                await visitPhase();
                 if (config.waitTime > 0) {
                     const settle = humanize(config.waitTime);
                     setStatus(`停留 ${settle} 秒，等待 Bing 记账...`);
@@ -1431,6 +1637,7 @@
     function stop(message) {
         runToken++;          // 让正在 await 的阶段自行退出
         clearTimers();
+        closeVisitTab();
         state.running = false;
         state.phase = Phase.IDLE;
         state.phaseUntil = 0;
@@ -1441,7 +1648,99 @@
     }
 
     // ==========================================================================
-    // 7. 初始化
+    // 7. 访问模式：本页是主标签页打开的「首条结果」
+    // ==========================================================================
+    // 脚本在所有站点上加载，但只有确认自己是被主标签页打开的结果页时才做事：
+    // 滚动一会儿，然后把自己关掉。其余页面立刻返回，不注入面板也不碰任何东西。
+
+    function isHelperPage() {
+        // /ck/a 是 Bing 的点击跳转页，虽然也在 bing.com 上，但那是结果页的中转站，
+        // 助手不该在那里再开一份面板、更不该接着跑搜索循环。
+        return HELPER_HOSTS.includes(location.hostname) && !/^\/ck\//i.test(location.pathname);
+    }
+
+    /** 时间戳落在合理区间内才认，免得一条存下来的旧链接把页面关掉。 */
+    function saneDeadline(value) {
+        const deadline = Number(value);
+        if (!deadline) return 0;
+        const now = Date.now();
+        return (deadline > now - VISIT_MAX_MS && deadline < now + VISIT_MAX_MS) ? deadline : 0;
+    }
+
+    function visitDeadlineFromHash() {
+        const hit = new RegExp(VISIT_HASH_KEY + '=(\\d+)').exec(location.hash || '');
+        return hit ? saneDeadline(hit[1]) : 0;
+    }
+
+    /** 滚动到点，然后关掉自己。主标签页也会来关，两边谁先到都行。 */
+    function runVisitMode(deadline) {
+        log('访问模式：', Math.max(0, Math.round((deadline - Date.now()) / 1000)), '秒后关闭本页');
+        const stopScroll = startScrolling();
+        const tick = () => {
+            if (Date.now() < deadline) {
+                setTimeout(tick, 400);
+                return;
+            }
+            stopScroll();
+            try {
+                window.close();
+            } catch (e) { /* 关不掉就算了，主标签页会来收尾 */ }
+        };
+        tick();
+    }
+
+    /**
+     * hash 丢了的兜底：朝打开自己的窗口要一个截止时间。
+     * 没人应答就什么都不做——那说明这个标签页不是脚本开的，只是个普通的新标签页。
+     */
+    function askOpenerForVisit() {
+        let opener = null;
+        try {
+            opener = window.opener;
+        } catch (e) { /* 忽略 */ }
+        if (!opener || !BING_HOST_RE.test(referrerHost())) return;
+
+        let timer = null;
+        let tries = 0;
+        const onMessage = (event) => {
+            if (event.source !== opener) return;
+            const data = event.data;
+            if (!data || data.type !== VISIT_MSG || data.role !== 'visit') return;
+            const deadline = saneDeadline(data.deadline);
+            if (!deadline) return;
+            stopAsking();
+            runVisitMode(deadline);
+        };
+        const stopAsking = () => {
+            clearInterval(timer);
+            window.removeEventListener('message', onMessage);
+        };
+        const ask = () => {
+            if (++tries > 10) {          // 问满 5 秒还没人应，就当自己是普通标签页
+                stopAsking();
+                return;
+            }
+            try {
+                opener.postMessage({ type: VISIT_MSG, role: 'hello' }, '*');
+            } catch (e) {
+                stopAsking();
+            }
+        };
+        window.addEventListener('message', onMessage);
+        ask();
+        timer = setInterval(ask, 500);
+    }
+
+    function referrerHost() {
+        try {
+            return new URL(document.referrer).hostname;
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // ==========================================================================
+    // 8. 初始化
     // ==========================================================================
 
     function debounce(fn, ms) {
@@ -1478,6 +1777,19 @@
     }
 
     function init() {
+        // 本页是脚本打开的首条结果：滚一会儿再关掉自己，别的什么都不做
+        const deadline = visitDeadlineFromHash();
+        if (deadline) {
+            runVisitMode(deadline);
+            return;
+        }
+        if (!isHelperPage()) {
+            // 其它站点（以及 Bing 的 /ck/a 中转页）只可能是被打开的结果页，
+            // hash 丢了就问一下打开自己的窗口；不是脚本开的就到此为止。
+            askOpenerForVisit();
+            return;
+        }
+
         loadConfig();
         createUI();
         applyCollapse();
@@ -1487,6 +1799,7 @@
 
         window.addEventListener('beforeunload', () => {
             clearTimers();
+            closeVisitTab();   // 本页要走了，别把浏览用的标签页留在那儿
             saveSession();
         });
 
