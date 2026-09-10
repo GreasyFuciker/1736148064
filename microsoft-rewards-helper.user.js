@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.6.0
-// @description  Bing Rewards 助手：按设定的检索次数执行搜索，每次搜索后在新标签页打开首条结果、滚动浏览再关掉，抓取相关搜索词与每日任务，并在页面跳转之间完整保持状态
+// @version      2.7.0
+// @description  Bing Rewards 助手：按设定的检索次数执行搜索，搜索词来自相关搜索/Bing 热搜与联想词，每次搜索后在新标签页打开首条结果、滚动浏览再关掉，并在页面跳转之间完整保持状态
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
@@ -36,7 +36,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.6.0';
+    const VERSION = '2.7.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -132,6 +132,40 @@
     /** 近似判重时回看的最近词数量。 */
     const RECENT_WINDOW = 6;
 
+    /**
+     * 搜索词历史：最近几天用过的词一律不再重复，这样每天的词都不一样。
+     * 只存词和时间戳，按 historyDays 过期，并且限制总条数。
+     */
+    const HISTORY_KEY = 'bing_rewards_term_history_v1';
+    const HISTORY_MAX = 600;
+
+    /** 候选词池低于这个数就去 Bing 那儿补货（热搜 + 联想词）。 */
+    const POOL_LOW_WATER = 8;
+    /** 一次补货最多拿几个话题去问联想词。问太多既慢又扎眼。 */
+    const SUGGEST_BASES = 3;
+    /** 补货请求的超时，超了就走本地兜底，绝不把主流程卡住。 */
+    const FETCH_TIMEOUT = 5 * 1000;
+    /** 连续这么多轮取不到词，就不再请求那两个接口了。 */
+    const TERM_FETCH_GIVE_UP = 3;
+
+    /**
+     * 组合词后缀。热搜和联想词都拿不到时（断网、接口改版），
+     * 用「话题 + 后缀」现造新词——这条路不依赖任何网络，永远不会枯竭。
+     */
+    const TERM_MODIFIERS = [
+        'guide', 'tips', 'review', 'checklist', 'for beginners', 'cost',
+        'comparison', 'best options', 'common mistakes', 'step by step',
+        'explained', 'pros and cons', 'what to know', 'how long'
+    ];
+    const TERM_MODIFIERS_CN = [
+        '怎么选', '推荐', '教程', '注意事项', '多少钱', '排行榜',
+        '入门', '对比', '常见问题', '经验分享', '值得买吗', '步骤'
+    ];
+    const CJK_RE = /[\u3400-\u9fff]/;
+
+    /** 明显不是搜索词的东西：翻页、导航入口之类。 */
+    const TERM_NOISE_RE = /^(下一页|上一页|更多|图片|视频|地图|资讯|新闻|翻译|词典|学术|购物|登录|设置|next|prev(ious)?|more|images|videos|maps|news|shopping|sign in|settings)$/i;
+
     /** 中断信号：停止搜索时用它把正在 await 的阶段安静地打断。 */
     const ABORT = Symbol('aborted');
 
@@ -155,7 +189,11 @@
         jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
         walkLength: [5, 8],        // 每个话题连续走几步后换新话题
         seedTopics: [...SEED_TOPICS], // 起始话题池，可在面板里编辑
-        serpScrollTime: 5,         // 打开首条结果之前，先在结果页上滚动多久（秒），0 表示不滚
+        serpScrollTime: 20,        // 打开首条结果之前，先在结果页上滚动多久（秒），0 表示不滚
+        serpJitterPercent: 70,     // 结果页滚动这一段单独的浮动幅度（±%），20 秒 ±70% → 6~34 秒
+        useTrending: true,         // 把 Bing 首页的热搜词也纳入词库
+        useSuggestions: true,      // 用 Bing 自己的联想接口扩充词库
+        historyDays: 3,            // 最近几天用过的词不再重复，0 表示只按天去重
         visitFirstResult: true,    // 搜索后在新标签页打开首条结果，滚动浏览再关掉
         autoClickDailyTasks: true  // 自动点击未完成的每日奖励卡片
     };
@@ -176,6 +214,11 @@
         day: today(),
         mainTerms: [],
         iframeTerms: [],
+        termPool: [],              // 热搜/联想补进来的候选词，跨跳转保留
+        termHistory: new Set(),    // 最近 historyDays 天用过的词
+        historyRows: [],           // 历史的原始记录 {t, term}
+        trendingTried: false,      // 本页是否已经取过热搜，别一轮问好几次
+        termFetchFailures: 0,      // 热搜/联想连续几次没取到词，超限就不再白费请求
         dailyTasks: [],
         loopGuard: false,          // 检测到刷新循环后，禁止一切自动点击
         sidebarFailures: 0,        // 连续读不到侧栏的次数，超限后不再浪费时间轮询
@@ -216,6 +259,8 @@
         if (num(saved.restTime, 60, 3600)) config.restTime = saved.restTime;
         if (num(saved.scrollTime, 3, 60)) config.scrollTime = saved.scrollTime;
         if (num(saved.serpScrollTime, 0, 60)) config.serpScrollTime = saved.serpScrollTime;
+        if (num(saved.serpJitterPercent, 0, 100)) config.serpJitterPercent = saved.serpJitterPercent;
+        if (num(saved.historyDays, 0, 30)) config.historyDays = saved.historyDays;
         if (num(saved.waitTime, 0, 60)) config.waitTime = saved.waitTime;
         if (num(saved.restEvery, 0, 100)) config.restEvery = saved.restEvery;
         if (num(saved.targetSearches, 1, 200)) config.targetSearches = saved.targetSearches;
@@ -234,6 +279,8 @@
             saved.searchInterval[0] <= saved.searchInterval[1]) {
             config.searchInterval = saved.searchInterval.slice();
         }
+        if (typeof saved.useTrending === 'boolean') config.useTrending = saved.useTrending;
+        if (typeof saved.useSuggestions === 'boolean') config.useSuggestions = saved.useSuggestions;
         if (typeof saved.visitFirstResult === 'boolean') config.visitFirstResult = saved.visitFirstResult;
         if (typeof saved.autoClickDailyTasks === 'boolean') config.autoClickDailyTasks = saved.autoClickDailyTasks;
     }
@@ -260,6 +307,7 @@
             phaseUntil: state.phaseUntil,
             usedTerms: [...state.usedTerms],
             recentTerms: state.recentTerms,
+            termPool: state.termPool,
             usedTopics: [...state.usedTopics],
             currentTopic: state.currentTopic,
             walkSteps: state.walkSteps,
@@ -267,6 +315,7 @@
             clickedOffers: [...state.clickedOffers],
             searchCount: state.searchCount,
             sidebarFailures: state.sidebarFailures,
+            termFetchFailures: state.termFetchFailures,
             day: state.day,
             updatedAt: Date.now()
         });
@@ -488,6 +537,7 @@
         { id: 'cfg-rest', label: '休息时间(分)', min: 1, max: 60, get: () => config.restTime / 60, set: v => { config.restTime = v * 60; }, unit: '分钟' },
         { id: 'cfg-scroll', label: '浏览时长(秒)', min: 3, max: 60, get: () => config.scrollTime, set: v => { config.scrollTime = v; }, unit: '秒' },
         { id: 'cfg-serp', label: '结果页滚动(秒)', min: 0, max: 60, get: () => config.serpScrollTime, set: v => { config.serpScrollTime = v; }, unit: '秒' },
+        { id: 'cfg-serp-jitter', label: '结果页浮动(%)', min: 0, max: 100, get: () => config.serpJitterPercent, set: v => { config.serpJitterPercent = v; }, unit: '%' },
         { id: 'cfg-settle', label: '停留时间(秒)', min: 0, max: 60, get: () => config.waitTime, set: v => { config.waitTime = v; }, unit: '秒' },
         { id: 'cfg-rest-every', label: '休息间隔(次)', min: 0, max: 100, get: () => config.restEvery, set: v => { config.restEvery = v; }, unit: '次' },
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
@@ -495,7 +545,8 @@
         { id: 'cfg-target', label: '检索次数', min: 1, max: 200, get: () => config.targetSearches, set: v => { config.targetSearches = v; }, unit: '次' },
         { id: 'cfg-jitter', label: '随机幅度(%)', min: 0, max: 60, get: () => config.jitterPercent, set: v => { config.jitterPercent = v; }, unit: '%' },
         { id: 'cfg-wmin', label: '话题步数下限', min: 1, max: 50, get: () => config.walkLength[0], set: v => { config.walkLength[0] = Math.min(v, config.walkLength[1]); }, unit: '步' },
-        { id: 'cfg-wmax', label: '话题步数上限', min: 1, max: 50, get: () => config.walkLength[1], set: v => { config.walkLength[1] = Math.max(v, config.walkLength[0]); }, unit: '步' }
+        { id: 'cfg-wmax', label: '话题步数上限', min: 1, max: 50, get: () => config.walkLength[1], set: v => { config.walkLength[1] = Math.max(v, config.walkLength[0]); }, unit: '步' },
+        { id: 'cfg-history', label: '不重复天数', min: 0, max: 30, get: () => config.historyDays, set: v => { config.historyDays = v; }, unit: '天' }
     ];
 
     function createUI() {
@@ -503,7 +554,7 @@
 
         const container = el('div', {
             id: 'rewards-helper-container',
-            css: `position:fixed;bottom:20px;right:20px;background:${t.bg};color:${t.text};
+            css: `position:fixed;bottom:20px;left:20px;background:${t.bg};color:${t.text};
                   border:1px solid ${t.border};border-radius:10px;padding:0;z-index:2147483000;
                   box-shadow:0 4px 20px rgba(0,0,0,.25);width:280px;font-size:12px;line-height:1.4;overflow:hidden;`
         });
@@ -545,7 +596,13 @@
             ]
         });
 
-        const content = el('div', { id: 'rewards-helper-content', css: 'padding:12px;', parent: container });
+        // 配置项越加越多，全展开能有 900px 高。面板是贴着底边往上长的，不限高的话
+        // 小屏幕上顶部的几项会跑到视口外面去，所以中间这块自己滚。
+        const content = el('div', {
+            id: 'rewards-helper-content',
+            css: 'padding:12px;max-height:65vh;overflow-y:auto;',
+            parent: container
+        });
 
         // --- 进度 ---
         el('div', {
@@ -602,7 +659,9 @@
                 el('div', { text: '主页面:', css: `font-weight:bold;font-size:10px;color:${t.textSecondary};margin-top:4px;` }),
                 el('div', { id: 'main-search-terms', css: 'padding-left:8px;margin-bottom:4px;' }),
                 el('div', { text: '侧栏推荐:', css: `font-weight:bold;font-size:10px;color:${t.textSecondary};` }),
-                el('div', { id: 'iframe-search-terms', css: 'padding-left:8px;' })
+                el('div', { id: 'iframe-search-terms', css: 'padding-left:8px;margin-bottom:4px;' }),
+                el('div', { text: '热搜/联想:', css: `font-weight:bold;font-size:10px;color:${t.textSecondary};` }),
+                el('div', { id: 'pool-terms', css: 'padding-left:8px;' })
             ]
         });
 
@@ -673,6 +732,32 @@
                 })
             ]
         });
+
+        for (const box of [
+            { id: 'use-trending', label: '纳入 Bing 热搜词', get: () => config.useTrending, set: v => { config.useTrending = v; } },
+            { id: 'use-suggestions', label: '用联想词扩充词库', get: () => config.useSuggestions, set: v => { config.useSuggestions = v; } }
+        ]) {
+            el('div', {
+                css: 'grid-column:1/-1;display:flex;align-items:center;gap:6px;margin-top:2px;',
+                parent: configForm,
+                children: [
+                    el('input', {
+                        id: box.id,
+                        attrs: { type: 'checkbox' },
+                        props: { checked: box.get() },
+                        css: 'cursor:pointer;width:14px;height:14px;',
+                        on: {
+                            change: (e) => {
+                                box.set(e.target.checked);
+                                saveConfig();
+                                setStatus(`${box.label}: ` + (e.target.checked ? '开启' : '关闭'));
+                            }
+                        }
+                    }),
+                    el('label', { text: box.label, attrs: { for: box.id }, css: 'cursor:pointer;font-size:11px;' })
+                ]
+            });
+        }
 
         el('div', {
             css: 'grid-column:1/-1;display:flex;align-items:center;gap:6px;margin-top:2px;',
@@ -863,6 +948,11 @@
         const box = $(id);
         if (!box) return;
         box.replaceChildren(...terms.map(term => el('div', { text: term })));
+    }
+
+    /** 词池在面板上只显示前 10 个，够看出「词是从哪儿来的」就行。 */
+    function renderPoolTerms() {
+        renderTermList('pool-terms', state.termPool.slice(0, 10).map(entry => entry.term));
     }
 
     function renderDailyTasks(tasks) {
@@ -1307,24 +1397,83 @@
         }
     }
 
+    /**
+     * 结果页上能拿到的相关搜索词。
+     *
+     * v2.6.0 及以前只认三个选择器，而且「第一个有结果的选择器」就收工。真实的 Bing
+     * 结果页早就换成了 .b_rs 那套版式，于是这里几乎永远抓不到词——随机游走每一步都
+     * 得换一个起始话题，24 个话题用完就报「没有可用的搜索词」停下来，正好三十来次。
+     * 现在把已知的几种版式全收一遍取并集，并且允许从 href 的 q 参数里取词。
+     */
     function readMainPageTerms() {
-        const current = (new URLSearchParams(location.search).get('q') || '').trim();
-        const accept = (text) => text.length > 2 && text.length < 60 && text !== current;
-        const selectors = ['.b_vList.b_divsec a[href*="/search?q="]', '.rslist a[href*="/search?q="]', '.richrsrailsuggestion_text'];
+        const current = (new URLSearchParams(location.search).get('q') || '').trim().toLowerCase();
+        const selectors = [
+            '.b_rs a[href*="/search?q="]',              // 底部「相关搜索」（当前版式）
+            '.b_vList.b_divsec a[href*="/search?q="]',  // 旧版式
+            '.rslist a[href*="/search?q="]',            // 更旧的版式
+            '#b_context a[href*="/search?q="]',         // 右栏：相关实体、热搜模块
+            '#b_results a[href*="/search?q="]',         // 结果区里任何站内检索链接
+            '.richrsrailsuggestion_text',               // 右栏推荐（纯文本，没有链接）
+            '.df_alsoAsk .b_algoheader'                 // 「大家还在问」
+        ];
 
-        let terms = [];
+        const terms = [];
         for (const selector of selectors) {
-            terms = [...document.querySelectorAll(selector)]
-                .map(node => node.textContent.trim())
-                .filter(accept);
-            if (terms.length) break;
+            for (const node of document.querySelectorAll(selector)) {
+                const text = (node.textContent || '').trim().replace(/\s+/g, ' ');
+                const term = isUsableTerm(text) ? text : queryOf(node.href || '');
+                if (isUsableTerm(term) && term.toLowerCase() !== current) terms.push(term);
+                if (terms.length > 60) break;
+            }
         }
 
-        if (!terms.length) return false;
+        if (!terms.length) {
+            log('这一页没抓到相关搜索词（会改用热搜/联想词/组合词）');
+            return false;
+        }
         state.mainTerms = [...new Set(terms)];
         renderTermList('main-search-terms', state.mainTerms);
         log('主页面搜索词:', state.mainTerms.length, '个');
         return true;
+    }
+
+    /** 一条字符串能不能当搜索词用。 */
+    function isUsableTerm(term) {
+        if (typeof term !== 'string') return false;
+        const text = term.trim();
+        if (text.length < 2 || text.length > 60) return false;
+        if (TERM_NOISE_RE.test(text)) return false;
+        if (!/[\p{L}\p{N}]/u.test(text)) return false;      // 纯符号
+        if (/^[\d\s.,:/-]+$/.test(text)) return false;      // 纯数字/翻页页码
+        return true;
+    }
+
+    /** 从一条 /search?q=... 里把查询词取出来。 */
+    function queryOf(href) {
+        try {
+            const value = new URL(href, location.href).searchParams.get('q') || '';
+            return value.trim().replace(/\s+/g, ' ');
+        } catch (e) {
+            return '';
+        }
+    }
+
+    /**
+     * 从任意文本（JSON 或 HTML）里把 /search?q=xxx 的查询词全抠出来。
+     * 热搜模块的字段名换来换去，但里面的检索链接总是这个形状，抓链接比抓字段稳。
+     */
+    function extractSearchQueries(text) {
+        const out = [];
+        const re = /\/search\?q=([^"'&\\\s<>]{2,120})/g;
+        let hit;
+        while ((hit = re.exec(text)) !== null && out.length < 40) {
+            let term = '';
+            try {
+                term = decodeURIComponent(hit[1].replace(/\+/g, ' ')).trim();
+            } catch (e) { /* 编码坏了就跳过 */ }
+            if (isUsableTerm(term)) out.push(term);
+        }
+        return [...new Set(out)];
     }
 
     // ==========================================================================
@@ -1348,68 +1497,265 @@
         return shared / Math.min(setA.size, setB.size) >= 0.8;
     }
 
-    /** 记账：全天去重 + 维护最近词窗口。 */
+    /** 记账：全天去重 + 维护最近词窗口 + 记进跨天历史。 */
     function markUsed(term) {
         state.usedTerms.add(term);
         state.recentTerms.push(term);
         while (state.recentTerms.length > RECENT_WINDOW) state.recentTerms.shift();
+        rememberTerm(term);
+    }
+
+    /**
+     * 跨天历史：最近 historyDays 天用过的词都不再用。
+     * 没有这一层的话，每天都从同一份起始话题池开工，第二天搜的还是那些词。
+     */
+    function loadTermHistory() {
+        if (config.historyDays <= 0) {          // 关掉跨天历史：只按天去重
+            state.historyRows = [];
+            state.termHistory = new Set();
+            return;
+        }
+        const rows = readJSON(HISTORY_KEY);
+        const keepAfter = Date.now() - Math.max(0, config.historyDays) * 24 * 60 * 60 * 1000;
+        state.historyRows = (Array.isArray(rows) ? rows : [])
+            .filter(row => row && typeof row.term === 'string' && typeof row.t === 'number' && row.t >= keepAfter)
+            .slice(-HISTORY_MAX);
+        state.termHistory = new Set(state.historyRows.map(row => row.term));
+        if (state.termHistory.size) {
+            log(`最近 ${config.historyDays} 天用过 ${state.termHistory.size} 个词，都不再重复`);
+        }
+    }
+
+    function rememberTerm(term) {
+        if (config.historyDays <= 0) return;
+        state.termHistory.add(term);
+        state.historyRows.push({ t: Date.now(), term });
+        if (state.historyRows.length > HISTORY_MAX) {
+            state.historyRows = state.historyRows.slice(-HISTORY_MAX);
+        }
+        writeJSON(HISTORY_KEY, state.historyRows);
+    }
+
+    /** 这个词现在能不能用：没用过、最近几天没用过、也不跟刚搜的几个词雷同。 */
+    function isFreshTerm(term) {
+        return isUsableTerm(term) &&
+            !state.usedTerms.has(term) &&
+            !state.termHistory.has(term) &&
+            !state.recentTerms.some(r => tooSimilar(term, r));
+    }
+
+    function pickRandom(list) {
+        return list[Math.floor(Math.random() * list.length)];
+    }
+
+    function shuffled(list) {
+        const out = list.slice();
+        for (let i = out.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [out[i], out[j]] = [out[j], out[i]];
+        }
+        return out;
+    }
+
+    /**
+     * 补充候选词池。两个来源都是 bing.com 的同源接口，不需要额外权限，也不碰第三方：
+     *   1. 热搜：首页数据里的检索链接，就是当天的热词；
+     *   2. 联想词：Bing 自己的 osjson 联想接口，返回的是真人常搜的词。
+     * 拿不到就静默返回——后面还有组合词兜底，绝不会因为取词失败停下来。
+     */
+    async function refillTermPool() {
+        if (state.termPool.length >= POOL_LOW_WATER) return;
+        // 接口连着几轮都取不到词（改版了、被墙了、断网了），就别再每轮白发请求，
+        // 后面一路用组合词兜着。这跟侧栏读不到之后不再轮询是一个道理。
+        if (state.termFetchFailures >= TERM_FETCH_GIVE_UP) return;
+
+        const found = [];
+        let tried = false;
+
+        if (config.useTrending && !state.trendingTried) {
+            state.trendingTried = true;
+            tried = true;
+            const hot = await fetchTrendingTerms();
+            if (hot.length) log('热搜词:', hot.length, '个');
+            for (const term of hot) found.push({ term, source: '热搜词' });
+        }
+
+        if (config.useSuggestions) {
+            tried = true;
+            for (const base of shuffled(config.seedTopics).slice(0, SUGGEST_BASES)) {
+                const list = await fetchSuggestions(base);
+                for (const term of list) found.push({ term, source: '联想词' });
+            }
+        }
+
+        if (tried) {
+            if (found.length) {
+                state.termFetchFailures = 0;
+            } else if (++state.termFetchFailures >= TERM_FETCH_GIVE_UP) {
+                log('热搜/联想接口连续取不到词，后面不再请求，改用组合词');
+            }
+            // 每一页都是新的运行环境，计数不落盘的话下次加载又从 0 开始，永远攒不够
+            saveSession();
+        }
+
+        if (!found.length) return;
+
+        // 打散：同一个词根的联想词挨在一起搜，看着就是机器在遍历
+        const known = new Set(state.termPool.map(entry => entry.term));
+        for (const entry of shuffled(found)) {
+            if (known.has(entry.term) || !isFreshTerm(entry.term)) continue;
+            known.add(entry.term);
+            state.termPool.push(entry);
+        }
+        if (state.termPool.length > 60) state.termPool.length = 60;
+        log('候选词池:', state.termPool.length, '个');
+        renderPoolTerms();
+        saveSession();
+    }
+
+    async function fetchTrendingTerms() {
+        // 首页数据里带着热搜模块，字段名换过好几轮，但里面的 /search?q=… 链接一直都在
+        const text = await fetchText(`${location.origin}/hp/api/model`);
+        const fromApi = text ? extractSearchQueries(text) : [];
+        if (fromApi.length) return fromApi;
+
+        // 接口不给就退回页面上的热搜/推荐模块（右栏、首页热搜条）
+        return [...document.querySelectorAll(
+            '#b_context a[href*="/search?q="], .hp_trending a[href*="/search?q="], .trending a[href*="/search?q="]'
+        )].map(node => queryOf(node.href)).filter(isUsableTerm);
+    }
+
+    async function fetchSuggestions(base) {
+        const text = await fetchText(`${location.origin}/osjson.aspx?query=${encodeURIComponent(base)}`);
+        if (!text) return [];
+        try {
+            // 正常返回：["coffee",["coffee near me","coffee maker",...]]
+            const data = JSON.parse(text);
+            const list = (Array.isArray(data) && Array.isArray(data[1])) ? data[1] : [];
+            return list.map(item => String(item).trim()).filter(isUsableTerm);
+        } catch (e) {
+            // 接口改版返回了 HTML，就走通用的「抠检索链接」那条路
+            return extractSearchQueries(text);
+        }
+    }
+
+    /** 带超时的 GET。取词失败一律当作没取到，绝不把主流程卡住。 */
+    async function fetchText(url) {
+        const controller = (typeof AbortController === 'function') ? new AbortController() : null;
+        let timer = null;
+        try {
+            if (controller) timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+            const res = await fetch(url, controller ? { signal: controller.signal } : undefined);
+            if (!res.ok) return '';
+            return await res.text();
+        } catch (e) {
+            log('取词请求失败:', url.split('?')[0], e && e.message);
+            return '';
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
+    /** 从词池里拿一个还能用的词。 */
+    function takeFromPool() {
+        while (state.termPool.length) {
+            const entry = state.termPool.shift();
+            if (entry && isFreshTerm(entry.term)) return { term: entry.term, source: entry.source || '联想词' };
+        }
+        return null;
+    }
+
+    /**
+     * 最后的兜底：话题 + 后缀现造一个词。
+     * 24 个话题 × 14 个后缀 = 336 个组合，且完全不依赖网络，
+     * 所以「没有可用的搜索词」这条死路基本上不会再走到。
+     */
+    function buildComboTerm() {
+        for (const seed of shuffled(config.seedTopics)) {
+            const modifiers = CJK_RE.test(seed) ? TERM_MODIFIERS_CN : TERM_MODIFIERS;
+            for (const modifier of shuffled(modifiers)) {
+                const term = `${seed} ${modifier}`;
+                if (isFreshTerm(term)) return term;
+            }
+        }
+        return null;
     }
 
     /** 当前页面上还能用的词，主页面优先、侧栏次之，已用过和近似的都排除。 */
     function availableTerms() {
-        const usable = (list) => list.filter(t =>
-            !state.usedTerms.has(t) && !state.recentTerms.some(r => tooSimilar(t, r)));
+        const usable = (list) => list.filter(isFreshTerm);
         const main = usable(state.mainTerms);
         if (main.length) return { terms: main, source: '主页面' };
         return { terms: usable(state.iframeTerms), source: '侧栏' };
     }
 
-    /**
-     * 换一个与当前话题无关的新起点，并重新掷出这一轮要走的步数。
-     * 话题池用尽时洗牌重来；连话题带词全用过了返回 null，交回给页面词。
-     */
-    function nextTopic() {
-        const unused = (skipTopics) => config.seedTopics.filter(t =>
-            (skipTopics ? true : !state.usedTopics.has(t)) && !state.usedTerms.has(t));
-
-        let pool = unused(false);
-        if (!pool.length) {
-            state.usedTopics.clear();          // 一天里话题走完就重新洗牌
-            pool = unused(true);
-        }
-        if (!pool.length) return null;
-
-        const topic = pool[Math.floor(Math.random() * pool.length)];
+    /** 以某个词为起点开一段新的游走，并掷出这一轮要走的步数。 */
+    function startWalk(term) {
         const [min, max] = config.walkLength;
-        state.usedTopics.add(topic);
-        state.currentTopic = topic;
+        state.currentTopic = term;
         state.walkSteps = 0;
         state.walkLimit = min + Math.floor(Math.random() * (max - min + 1));
-        markUsed(topic);
-        log(`切换话题:「${topic}」，本轮走 ${state.walkLimit} 步`);
+        markUsed(term);
+        log(`切换话题:「${term}」，本轮走 ${state.walkLimit} 步`);
+    }
+
+    /**
+     * 换一个与当前话题无关的起始话题。
+     * 优先挑最近几天都没用过的；实在没有了就只按「今天没用过」来挑；
+     * 再没有就返回 null——交给热搜/联想/组合词，而不是像以前那样直接停机。
+     */
+    function nextTopic() {
+        const unusedToday = config.seedTopics.filter(t => !state.usedTopics.has(t));
+        const pool = unusedToday.filter(isFreshTerm).length
+            ? unusedToday.filter(isFreshTerm)
+            : unusedToday.filter(t => !state.usedTerms.has(t));
+        if (!pool.length) return null;
+
+        const topic = pickRandom(pool);
+        state.usedTopics.add(topic);
+        startWalk(topic);
         return topic;
     }
 
     /**
-     * 选词。两种情况会跳到新话题而不是顺着当前结果页继续走：
-     *   1. 当前话题已经走满了掷出的步数；
-     *   2. 当前页面没有可用的新词（都用过或都太像）。
-     * 否则从当前结果页的相关搜索里随机取一个，这样话题是连贯的，
-     * 但每隔 5~8 步就会整体换到一个不相关的领域。
+     * 选词。顺着当前结果页的相关搜索走，走满掷出的步数、或者这一页没有新词了，
+     * 就换一个不相关的起点重新开始。起点按这个顺序找，前一个空了才用后一个：
+     *
+     *   起始话题池 → 热搜词/联想词（Bing 同源接口取来的） → 话题+后缀的组合词
+     *
+     * 三条路都空了才会返回 null。组合词不依赖网络，所以实际上走不到那一步。
      */
     function pickTerm() {
         const available = availableTerms();
-        const needNewTopic = state.walkSteps >= state.walkLimit || !available.terms.length;
 
-        if (needNewTopic) {
-            const topic = nextTopic();
-            if (topic) return { term: topic, source: '新话题' };
-            if (!available.terms.length) return null;   // 话题池也空了
+        if (state.walkSteps < state.walkLimit && available.terms.length) {
+            const term = pickRandom(available.terms);
+            markUsed(term);
+            return { term, source: available.source };
         }
 
-        const base = available.terms[Math.floor(Math.random() * available.terms.length)];
-        markUsed(base);
-        return { term: base, source: available.source };
+        const topic = nextTopic();
+        if (topic) return { term: topic, source: '新话题' };
+
+        const pooled = takeFromPool();
+        if (pooled) {
+            startWalk(pooled.term);
+            return { term: pooled.term, source: pooled.source };
+        }
+
+        const combo = buildComboTerm();
+        if (combo) {
+            startWalk(combo);
+            return { term: combo, source: '组合词' };
+        }
+
+        // 起点全没了，但这一页还有没搜过的词，那就先用着
+        if (available.terms.length) {
+            const term = pickRandom(available.terms);
+            markUsed(term);
+            return { term, source: available.source };
+        }
+        return null;
     }
 
     // ==========================================================================
@@ -1790,13 +2136,14 @@
     }
 
     /**
-     * 给一个固定时长加上 ±jitterPercent 的随机浮动。
+     * 给一个固定时长加上 ±幅度 的随机浮动。
      * 真人不会每次都停留恰好 8 秒、滚动恰好 10 秒——固定值本身就是特征。
-     * jitterPercent 为 0 时原样返回；传入 0 时恒为 0（用于关闭「停留」阶段）。
+     * 不传 percent 就用全局的 jitterPercent；结果页滚动那一段用自己的 serpJitterPercent。
      */
-    function humanize(seconds) {
-        if (!seconds || config.jitterPercent <= 0) return seconds;
-        const swing = (Math.random() * 2 - 1) * (config.jitterPercent / 100);
+    function humanize(seconds, percent) {
+        const swingPercent = (typeof percent === 'number') ? percent : config.jitterPercent;
+        if (!seconds || swingPercent <= 0) return seconds;
+        const swing = (Math.random() * 2 - 1) * (swingPercent / 100);
         return Math.max(1, Math.round(seconds * (1 + swing)));
     }
 
@@ -1838,7 +2185,7 @@
 
             if (isResultsPage()) {
                 // 先在结果页上扫一眼——真人也是先看几眼结果再点进去——然后再打开首条结果
-                if (config.serpScrollTime > 0) await scrollPhase(humanize(config.serpScrollTime));
+                if (config.serpScrollTime > 0) await scrollPhase(humanize(config.serpScrollTime, config.serpJitterPercent));
                 await visitPhase();
                 if (config.waitTime > 0) {
                     const settle = humanize(config.waitTime);
@@ -1868,6 +2215,8 @@
             }
 
             readMainPageTerms();
+            // 词池见底就趁这会儿去补：请求带超时，失败也不影响后面的流程
+            await refillTermPool().catch(() => {});
 
             const gap = randomInterval();
             setStatus(`等待 ${gap} 秒后进行下一次搜索`);
@@ -2057,6 +2406,7 @@
     function restore(saved) {
         state.usedTerms = new Set(saved.usedTerms || []);   // v1 在这里被清空，导致重复搜索
         state.recentTerms = saved.recentTerms || [];
+        state.termPool = Array.isArray(saved.termPool) ? saved.termPool : [];
         state.usedTopics = new Set(saved.usedTopics || []);
         state.currentTopic = saved.currentTopic || '';
         state.walkSteps = saved.walkSteps || 0;
@@ -2064,10 +2414,12 @@
         state.clickedOffers = new Set(saved.clickedOffers || []);
         state.searchCount = saved.searchCount || 0;
         state.sidebarFailures = saved.sidebarFailures || 0;
+        state.termFetchFailures = saved.termFetchFailures || 0;
         state.day = saved.day || today();
         state.running = true;
         setButtonRunning(true);
         renderProgress();
+        renderPoolTerms();
         setStatus('检测到上次任务，正在继续...');
     }
 
@@ -2096,6 +2448,7 @@
         }
 
         loadConfig();
+        loadTermHistory();
         createUI();
         applyCollapse();
         renderProgress();
