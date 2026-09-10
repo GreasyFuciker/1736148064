@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.8.0
+// @version      2.8.1
 // @description  Bing Rewards 助手：在搜索框里逐字输入并提交，按概率点开结果页浏览，时长与间隔走长尾分布、按轮次分时段休息，搜索词来自相关搜索/Bing 热搜与联想词
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
@@ -36,7 +36,7 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.8.0';
+    const VERSION = '2.8.1';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
@@ -2371,29 +2371,51 @@
      * 返回 false 表示这条路没走通，调用方会退回直接跳转。
      */
     async function typeAndSubmit(term) {
-        const box = document.querySelector('#sb_form_q, input[name="q"]:not([type="hidden"])');
-        const form = box && (box.form || document.querySelector('#sb_form'));
-        if (!box || !form || box.offsetParent === null) return false;
+        const box = findSearchBox();
+        if (!box) {
+            // 把页面上所有候选框打出来，下次一眼就能看出是选择器没覆盖到还是别的原因
+            log('页面上没找到可用的搜索框，改用直接跳转。候选:',
+                [...document.querySelectorAll('#sb_form_q, input[name="q"], textarea[name="q"]')]
+                    .map(node => {
+                        const rect = node.getBoundingClientRect();
+                        return `${node.tagName}#${node.id || '-'}[type=${node.type}] ${Math.round(rect.width)}x${Math.round(rect.height)}`;
+                    }));
+            return false;
+        }
+        const form = box.form || box.closest('form') || document.querySelector('#sb_form');
+        if (!form) {
+            log('搜索框不在表单里，改用直接跳转');
+            return false;
+        }
 
         try {
+            log('在搜索框里输入:', term);
             box.focus();
             box.click();
             setNativeValue(box, '');
             for (const ch of term) {
-                setNativeValue(box, box.value + ch);
                 box.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true }));
+                setNativeValue(box, box.value + ch);
                 box.dispatchEvent(new KeyboardEvent('keyup', { key: ch, bubbles: true }));
                 await sleep(TYPE_DELAY[0] + Math.random() * (TYPE_DELAY[1] - TYPE_DELAY[0]));
             }
             await sleep(TYPE_SETTLE[0] + Math.random() * (TYPE_SETTLE[1] - TYPE_SETTLE[0]));
 
             markIntentionalNav();
+            // 依次试三种提交方式。哪一种生效了，页面就开始跳转，
+            // 后面的代码根本不会执行；全都没动静才退回直接跳 URL。
+            pressEnter(box);
+            await sleep(600);
+
+            const button = document.querySelector('#sb_form_go, #search_icon, label[for="sb_form_go"], #sb_form button[type="submit"]');
+            if (button) button.click();
+            await sleep(600);
+
             if (typeof form.requestSubmit === 'function') form.requestSubmit();
             else form.submit();
 
-            // 提交没生效的话页面还留在这儿，等一会儿还没跳走就认栽
             await sleep(SUBMIT_WATCHDOG);
-            log('表单提交后没有跳转，改用直接跳转');
+            log('输入完了但页面没跳走，改用直接跳转');
             return false;
         } catch (e) {
             if (e === ABORT) throw e;
@@ -2403,11 +2425,40 @@
     }
 
     /**
+     * 页面上真正能用的那个搜索框。两个坑都在这儿：
+     *
+     * 1. querySelector 的选择器列表是按「文档顺序」命中的，不是按选择器先后——
+     *    Bing 页面里排在 #sb_form_q 前面还有别的 input[name="q"]（备用表单、
+     *    移动版布局），直接取会拿到一个用户根本看不见的框，打字打了个寂寞。
+     * 2. 不能用 offsetParent 判断可见性：Bing 的搜索框在固定定位的头部里，
+     *    只要祖先有 position:fixed，offsetParent 就恒为 null，明明看得见也会被判成隐藏。
+     *    改用 getBoundingClientRect 量实际尺寸。
+     * 新版 Bing 有的布局把搜索框换成了 textarea，所以两种都收。
+     */
+    function findSearchBox() {
+        const nodes = [...document.querySelectorAll('#sb_form_q, input[name="q"], textarea[name="q"]')];
+        return nodes.find(node => {
+            if (node.disabled || node.readOnly || node.type === 'hidden') return false;
+            const rect = node.getBoundingClientRect();
+            return rect.width > 40 && rect.height > 8;
+        }) || null;
+    }
+
+    /** 真人是按回车提交的，Bing 的提交逻辑也多半挂在键盘事件上。 */
+    function pressEnter(box) {
+        const options = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+        for (const type of ['keydown', 'keypress', 'keyup']) {
+            box.dispatchEvent(new KeyboardEvent(type, options));
+        }
+    }
+
+    /**
      * 给受控输入框赋值。React/框架化的输入框会拦截 value 的直接赋值，
      * 走原型上的 setter 再补一个 input 事件才能让页面自己的监听收到。
      */
     function setNativeValue(input, value) {
-        const proto = pageWindow.HTMLInputElement && pageWindow.HTMLInputElement.prototype;
+        const kind = (input.tagName === 'TEXTAREA') ? pageWindow.HTMLTextAreaElement : pageWindow.HTMLInputElement;
+        const proto = kind && kind.prototype;
         const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value');
         if (setter && setter.set) setter.set.call(input, value);
         else input.value = value;
