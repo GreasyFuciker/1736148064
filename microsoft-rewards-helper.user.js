@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Microsoft Rewards 自动助手
 // @namespace    https://github.com/GreasyFuciker/1736148064
-// @version      2.7.0
-// @description  Bing Rewards 助手：按设定的检索次数执行搜索，搜索词来自相关搜索/Bing 热搜与联想词，每次搜索后在新标签页打开首条结果、滚动浏览再关掉，并在页面跳转之间完整保持状态
+// @version      2.8.0
+// @description  Bing Rewards 助手：在搜索框里逐字输入并提交，按概率点开结果页浏览，时长与间隔走长尾分布、按轮次分时段休息，搜索词来自相关搜索/Bing 热搜与联想词
 // @author       SOYS（v1）/ 重构优化（v2）
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
@@ -36,12 +36,12 @@
     // 0. 常量
     // ==========================================================================
 
-    const VERSION = '2.7.0';
+    const VERSION = '2.8.0';
     const CONFIG_KEY = 'bing_rewards_config_v2';
     const SESSION_KEY = 'bing_rewards_session_v2';
 
-    /** 会话在无活动多久之后视为过期（毫秒）。需要大于最长的休息时间。 */
-    const SESSION_TTL = 45 * 60 * 1000;
+    /** 会话在无活动多久之后视为过期（毫秒）。必须大于最长的一次休息（现在有分时段长休）。 */
+    const SESSION_TTL = 3 * 60 * 60 * 1000;
 
     /** 阶段名，同时作为持久化的断点标记。 */
     const Phase = {
@@ -132,6 +132,26 @@
     /** 近似判重时回看的最近词数量。 */
     const RECENT_WINDOW = 6;
 
+    /** 每天实际要搜多少次，当天定一次就不再变（存这里，停了再开也是同一个数）。 */
+    const DAILY_KEY = 'bing_rewards_daily_v1';
+
+    /** 打字时每个字之间的间隔（毫秒）。真人不是匀速的，所以是一个区间。 */
+    const TYPE_DELAY = [40, 170];
+    /** 打完字到按下回车之间的停顿（毫秒）——真人会瞄一眼联想列表。 */
+    const TYPE_SETTLE = [250, 900];
+    /** 表单提交后多久还没跳走，就认为提交没生效，退回直接跳 URL。 */
+    const SUBMIT_WATCHDOG = 4 * 1000;
+
+    /**
+     * 长尾分布用的几个概率。真人的时间分布不是均匀的：
+     * 大量很短的、少量很长的，中间是一个偏左的峰。
+     */
+    const LONG_PAUSE_CHANCE = 0.12;   // 两次搜索之间偶尔走神几分钟
+    const BOUNCE_CHANCE = 0.25;       // 点进去发现不对，几秒就退回来
+    const LONG_DWELL_CHANCE = 0.15;   // 看进去了，读很久
+    /** 一条结果被点中的衰减系数：第 1 条 45%，第 2 条约 25%，越往下越少。 */
+    const CLICK_DECAY = 0.45;
+
     /**
      * 搜索词历史：最近几天用过的词一律不再重复，这样每天的词都不一样。
      * 只存词和时间戳，按 historyDays 过期，并且限制总条数。
@@ -184,8 +204,15 @@
         scrollTime: 10,            // 每次搜索后的滚动时长（秒）
         waitTime: 8,               // 滚动结束后的停留时长（秒），让 Bing 记账
         searchInterval: [12, 25],  // 两次搜索之间的随机间隔（秒）
-        restEvery: 12,             // 每搜索多少次休息一次，0 表示不休息
-        targetSearches: 40,        // 每天检索多少次。这是唯一的终止条件
+        restEvery: 12,             // 每搜索多少次歇一小会儿，0 表示不歇
+        longBreakEvery: 12,        // 每搜索多少次歇一次长的（分时段用），0 表示不分时段
+        longBreakTime: 25 * 60,    // 长休息的时长（秒）
+        targetSearches: 40,        // 每天检索多少次（实际值会按下面的幅度浮动）
+        targetJitterPercent: 20,   // 每天实际次数的浮动幅度（±%），0 表示每天都是固定次数
+        sidebarEvery: 10,          // 每检索多少次才去查一次奖励面板，0 表示从不查
+        clickChance: 55,           // 有多大概率点进结果页（%），其余的只扫一眼结果页
+        clickDepth: 5,             // 点的时候在前几条自然结果里挑
+        typeQuery: true,           // 在搜索框里逐字输入再提交，而不是直接跳 /search?q=
         jitterPercent: 30,         // 各阶段时长的随机浮动幅度（±%），0 表示关闭
         walkLength: [5, 8],        // 每个话题连续走几步后换新话题
         seedTopics: [...SEED_TOPICS], // 起始话题池，可在面板里编辑
@@ -211,6 +238,7 @@
         walkLimit: 0,              // 本话题这次要走的步数（随机 walkLength）
         clickedOffers: new Set(),  // 本日已点过的奖励卡片链接
         searchCount: 0,            // 本日已发起的搜索次数，唯一的终止依据
+        target: 0,                 // 今天实际要搜多少次（当天固定，见 dailyTarget）
         day: today(),
         mainTerms: [],
         iframeTerms: [],
@@ -263,6 +291,12 @@
         if (num(saved.historyDays, 0, 30)) config.historyDays = saved.historyDays;
         if (num(saved.waitTime, 0, 60)) config.waitTime = saved.waitTime;
         if (num(saved.restEvery, 0, 100)) config.restEvery = saved.restEvery;
+        if (num(saved.longBreakEvery, 0, 200)) config.longBreakEvery = saved.longBreakEvery;
+        if (num(saved.longBreakTime, 60, 7200)) config.longBreakTime = saved.longBreakTime;
+        if (num(saved.targetJitterPercent, 0, 60)) config.targetJitterPercent = saved.targetJitterPercent;
+        if (num(saved.sidebarEvery, 0, 200)) config.sidebarEvery = saved.sidebarEvery;
+        if (num(saved.clickChance, 0, 100)) config.clickChance = saved.clickChance;
+        if (num(saved.clickDepth, 1, 10)) config.clickDepth = saved.clickDepth;
         if (num(saved.targetSearches, 1, 200)) config.targetSearches = saved.targetSearches;
         if (num(saved.jitterPercent, 0, 60)) config.jitterPercent = saved.jitterPercent;
         if (Array.isArray(saved.walkLength) && saved.walkLength.length === 2 &&
@@ -279,6 +313,7 @@
             saved.searchInterval[0] <= saved.searchInterval[1]) {
             config.searchInterval = saved.searchInterval.slice();
         }
+        if (typeof saved.typeQuery === 'boolean') config.typeQuery = saved.typeQuery;
         if (typeof saved.useTrending === 'boolean') config.useTrending = saved.useTrending;
         if (typeof saved.useSuggestions === 'boolean') config.useSuggestions = saved.useSuggestions;
         if (typeof saved.visitFirstResult === 'boolean') config.visitFirstResult = saved.visitFirstResult;
@@ -539,11 +574,17 @@
         { id: 'cfg-serp', label: '结果页滚动(秒)', min: 0, max: 60, get: () => config.serpScrollTime, set: v => { config.serpScrollTime = v; }, unit: '秒' },
         { id: 'cfg-serp-jitter', label: '结果页浮动(%)', min: 0, max: 100, get: () => config.serpJitterPercent, set: v => { config.serpJitterPercent = v; }, unit: '%' },
         { id: 'cfg-settle', label: '停留时间(秒)', min: 0, max: 60, get: () => config.waitTime, set: v => { config.waitTime = v; }, unit: '秒' },
-        { id: 'cfg-rest-every', label: '休息间隔(次)', min: 0, max: 100, get: () => config.restEvery, set: v => { config.restEvery = v; }, unit: '次' },
+        { id: 'cfg-rest-every', label: '小休间隔(次)', min: 0, max: 100, get: () => config.restEvery, set: v => { config.restEvery = v; }, unit: '次' },
+        { id: 'cfg-long-every', label: '长休间隔(次)', min: 0, max: 200, get: () => config.longBreakEvery, set: v => { config.longBreakEvery = v; }, unit: '次' },
+        { id: 'cfg-long-time', label: '长休时间(分)', min: 1, max: 120, get: () => config.longBreakTime / 60, set: v => { config.longBreakTime = v * 60; }, unit: '分钟' },
         { id: 'cfg-imin', label: '间隔下限(秒)', min: 1, max: 600, get: () => config.searchInterval[0], set: v => { config.searchInterval[0] = Math.min(v, config.searchInterval[1]); }, unit: '秒' },
         { id: 'cfg-imax', label: '间隔上限(秒)', min: 1, max: 600, get: () => config.searchInterval[1], set: v => { config.searchInterval[1] = Math.max(v, config.searchInterval[0]); }, unit: '秒' },
         { id: 'cfg-target', label: '检索次数', min: 1, max: 200, get: () => config.targetSearches, set: v => { config.targetSearches = v; }, unit: '次' },
         { id: 'cfg-jitter', label: '随机幅度(%)', min: 0, max: 60, get: () => config.jitterPercent, set: v => { config.jitterPercent = v; }, unit: '%' },
+        { id: 'cfg-target-jitter', label: '次数浮动(%)', min: 0, max: 60, get: () => config.targetJitterPercent, set: v => { config.targetJitterPercent = v; }, unit: '%' },
+        { id: 'cfg-click-chance', label: '点击概率(%)', min: 0, max: 100, get: () => config.clickChance, set: v => { config.clickChance = v; }, unit: '%' },
+        { id: 'cfg-click-depth', label: '点击范围(条)', min: 1, max: 10, get: () => config.clickDepth, set: v => { config.clickDepth = v; }, unit: '条' },
+        { id: 'cfg-sidebar-every', label: '查面板间隔(次)', min: 0, max: 200, get: () => config.sidebarEvery, set: v => { config.sidebarEvery = v; }, unit: '次' },
         { id: 'cfg-wmin', label: '话题步数下限', min: 1, max: 50, get: () => config.walkLength[0], set: v => { config.walkLength[0] = Math.min(v, config.walkLength[1]); }, unit: '步' },
         { id: 'cfg-wmax', label: '话题步数上限', min: 1, max: 50, get: () => config.walkLength[1], set: v => { config.walkLength[1] = Math.max(v, config.walkLength[0]); }, unit: '步' },
         { id: 'cfg-history', label: '不重复天数', min: 0, max: 30, get: () => config.historyDays, set: v => { config.historyDays = v; }, unit: '天' }
@@ -734,6 +775,7 @@
         });
 
         for (const box of [
+            { id: 'type-query', label: '在搜索框里打字提交', get: () => config.typeQuery, set: v => { config.typeQuery = v; } },
             { id: 'use-trending', label: '纳入 Bing 热搜词', get: () => config.useTrending, set: v => { config.useTrending = v; } },
             { id: 'use-suggestions', label: '用联想词扩充词库', get: () => config.useSuggestions, set: v => { config.useSuggestions = v; } }
         ]) {
@@ -917,7 +959,7 @@
      */
     function renderProgress() {
         const done = state.searchCount;
-        const target = config.targetSearches;
+        const target = runTarget();
 
         let text = `检索: ${done}/${target} 次`;
         if (done >= target) text += ' (已完成)';
@@ -1255,10 +1297,19 @@
     }
 
     /**
-     * 结果页上的第一条自然结果。广告块和站内入口（图片/视频/相关搜索）都排掉，
-     * 剩下的就是真人会点进去的那一条。找不到返回 null，由调用方退回原地滚动。
+     * 结果页上的前几条自然结果（最多 clickDepth 条）。广告块和站内入口
+     * （图片/视频/相关搜索）都排掉，剩下的就是真人可能点进去的那几条。
+     * 一条都没有就返回空数组，由调用方退回原地滚动。
      */
-    function findFirstResultLink() {
+    /** 按人的点击习惯挑一条结果：第 1 条最多，越往下越少。 */
+    function pickResultLink(links) {
+        for (let i = 0; i < links.length - 1; i++) {
+            if (Math.random() < CLICK_DECAY) return { link: links[i], rank: i + 1 };
+        }
+        return { link: links[links.length - 1], rank: links.length };
+    }
+
+    function findResultLinks() {
         // Bing 的结果页版式换得很勤，所以从最精确的选择器一路放宽到「结果区里的第一条外链」，
         // 而不是钉死在某一版 DOM 上。真正的过滤交给 isVisitableResult。
         const selectors = [
@@ -1269,13 +1320,19 @@
             '#b_results a[href]',                 // 兜底：结果区里的第一条外链
             '#b_content a[href]'                  // 连 #b_results 都找不到时
         ];
+        const links = [];
+        const seen = new Set();
         for (const selector of selectors) {
             for (const node of document.querySelectorAll(selector)) {
-                if (isVisitableResult(node)) return node;
+                if (!isVisitableResult(node) || seen.has(node.href)) continue;
+                seen.add(node.href);
+                links.push(node);
+                if (links.length >= Math.max(1, config.clickDepth)) return links;
             }
+            if (links.length) return links;   // 精确的选择器有货，就别再往下放宽了
         }
-        logNoResultLink();
-        return null;
+        if (!links.length) logNoResultLink();
+        return links;
     }
 
     /** 一条都挑不出来时，把页面上到底有什么打到控制台，方便照着调选择器。 */
@@ -1691,12 +1748,24 @@
 
     /** 以某个词为起点开一段新的游走，并掷出这一轮要走的步数。 */
     function startWalk(term) {
-        const [min, max] = config.walkLength;
         state.currentTopic = term;
         state.walkSteps = 0;
-        state.walkLimit = min + Math.floor(Math.random() * (max - min + 1));
+        state.walkLimit = rollWalkLimit();
         markUsed(term);
         log(`切换话题:「${term}」，本轮走 ${state.walkLimit} 步`);
+    }
+
+    /**
+     * 这一轮在同一个话题上走几步。
+     * 固定 5~8 步是机器味最重的地方之一：真人多数时候搜一下就走，
+     * 偶尔会在一个话题上连着搜十几次。所以两头都留了尾巴。
+     */
+    function rollWalkLimit() {
+        const [min, max] = config.walkLength;
+        const roll = Math.random();
+        if (roll < 0.2) return 1;                                        // 看一眼就换话题
+        if (roll > 0.85) return max + Math.floor(Math.random() * max);   // 在一个话题上耗很久
+        return min + Math.floor(Math.random() * (max - min + 1));
     }
 
     /**
@@ -1942,19 +2011,32 @@
      * 没有可打开的结果、或者弹窗被浏览器拦下来，就退回原来的做法：在结果页滚动。
      */
     async function visitPhase() {
-        const seconds = humanize(config.scrollTime);
-        const link = config.visitFirstResult ? findFirstResultLink() : null;
-        if (!link) {
+        const seconds = dwellSeconds(config.scrollTime);
+        const links = config.visitFirstResult ? findResultLinks() : [];
+        if (!links.length) {
             return scrollPhase(seconds, config.visitFirstResult ? '没找到可打开的搜索结果' : '');
         }
 
-        const href = resolveResultUrl(link.href);
-        const label = (link.textContent || '').trim().slice(0, 24) || hostOf(href) || '首条结果';
+        // 不是每次搜索都会点进去。真人的点击率大概只有一半上下，
+        // 「每一次检索都恰好点开第一条」本身就是一个很扎眼的模式。
+        if (Math.random() * 100 >= config.clickChance) {
+            return scrollPhase(dwellSeconds(config.serpScrollTime || config.scrollTime), '这次只看结果页不点进去');
+        }
+
+        const { link, rank } = pickResultLink(links);
+        // 打开的是链接本身（Bing 的结果链接多半是 /ck/a 点击跳转）：
+        // 解码成真实地址虽然更省事，但那样 Bing 侧就完全看不到这次点击了。
+        // 票据里存的仍然是解码后的目标域名，落地页照样认得出自己。
+        const href = link.href;
+        const landing = resolveResultUrl(href);
+        const label = (link.textContent || '').trim().slice(0, 24) || hostOf(landing) || `第 ${rank} 条`;
         const deadline = Date.now() + seconds * 1000;
+
+        await hoverResult(link);
 
         // 票据先写、标签页后开：那一页可能比这行代码之后的任何东西都先加载完
         writeVisitTicket({
-            host: hostOf(href), deadline, createdAt: Date.now(), claimedAt: 0, doneAt: 0
+            host: hostOf(landing), deadline, createdAt: Date.now(), claimedAt: 0, doneAt: 0
         });
 
         const handle = openVisitTab(withVisitMarker(href, deadline));
@@ -1965,7 +2047,7 @@
 
         visitTab = handle;
         if (handle.win) installVisitBridge(handle.win, deadline);
-        setStatus(`新标签页浏览首条结果 ${seconds} 秒：${label}`);
+        setStatus(`打开第 ${rank} 条结果浏览 ${seconds} 秒：${label}`);
         try {
             // 收尾条件，谁先到算谁：那一页自己关了 / 说它浏览完了 /
             // 过了宽限还没有任何页面认领票据（说明那边没跑起脚本，别再干等）。
@@ -1978,6 +2060,33 @@
             reportVisitOutcome();
         } finally {
             closeVisitTab();
+        }
+    }
+
+    /**
+     * 点之前先把结果滚进视野、在链接上走一遍鼠标事件。
+     * Bing 自己的点击埋点挂在这些事件上，直接 window.open 的话，
+     * 页面侧看到的是「没有任何鼠标动作，结果却被打开了」。
+     * 这里刻意不派发 click —— 那会把当前标签页顶走。
+     */
+    async function hoverResult(link) {
+        try {
+            link.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            await sleep(220 + Math.random() * 480);
+            const rect = link.getBoundingClientRect();
+            const options = {
+                bubbles: true,
+                cancelable: true,
+                view: pageWindow,
+                clientX: Math.round(rect.left + rect.width * (0.15 + Math.random() * 0.6)),
+                clientY: Math.round(rect.top + rect.height * (0.3 + Math.random() * 0.4))
+            };
+            for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup']) {
+                link.dispatchEvent(new MouseEvent(type, options));
+            }
+        } catch (e) {
+            if (e === ABORT) throw e;
+            log('模拟鼠标事件失败（不影响打开）:', e && e.message);
         }
     }
 
@@ -2130,9 +2239,74 @@
         return false;
     }
 
+    /** 标准正态随机数（Box-Muller），下面几个长尾分布都用它。 */
+    function gaussian() {
+        let u = 0;
+        let v = 0;
+        while (!u) u = Math.random();
+        while (!v) v = Math.random();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+    }
+
+    /** 对数正态：峰偏在左边（偏向 min），尾巴伸向 max。比均匀分布像人得多。 */
+    function logNormalBetween(min, max) {
+        if (!(max > min)) return min;
+        const peak = min + (max - min) * 0.35;
+        const value = Math.exp(Math.log(peak) + gaussian() * 0.5);
+        return clamp(value, min, max);
+    }
+
+    /**
+     * 两次搜索之间的间隔。
+     * 均匀分布是最容易看出来的一种「随机」：真人的间隔集中在偏短的一段，
+     * 偶尔会因为去干别的事而空出好几分钟。所以这里是「对数正态 + 偶发长停顿」。
+     */
     function randomInterval() {
         const [min, max] = config.searchInterval;
-        return min + Math.floor(Math.random() * (max - min + 1));
+        if (Math.random() < LONG_PAUSE_CHANCE) {
+            return Math.round(max * (1.5 + Math.random() * 2.5));   // 走神了
+        }
+        return Math.round(logNormalBetween(min, max));
+    }
+
+    /**
+     * 浏览类时长（结果页扫一眼、落地页停留）。
+     * 真人有大量「点进去两秒就退出来」和少量「读很久」，中间才是正常阅读。
+     */
+    function dwellSeconds(base) {
+        if (!base) return base;
+        const roll = Math.random();
+        if (roll < BOUNCE_CHANCE) return Math.max(2, Math.round(base * (0.15 + Math.random() * 0.25)));
+        if (roll > 1 - LONG_DWELL_CHANCE) return Math.round(base * (1.8 + Math.random() * 1.7));
+        return Math.max(2, Math.round(logNormalBetween(base * 0.5, base * 1.6)));
+    }
+
+    /**
+     * 今天实际搜多少次。每天在设定值上下浮动一次，当天定了就不再变
+     * （停了再开还是同一个数）——每天都恰好 40 次本身就是个特征。
+     */
+    function dailyTarget() {
+        const saved = readJSON(DAILY_KEY);
+        if (saved && saved.day === today() && typeof saved.target === 'number' && saved.target > 0) {
+            return saved.target;
+        }
+        const swing = (Math.random() * 2 - 1) * (config.targetJitterPercent / 100);
+        const target = Math.max(1, Math.round(config.targetSearches * (1 + swing)));
+        writeJSON(DAILY_KEY, { day: today(), target });
+        log(`今天计划检索 ${target} 次（设定 ${config.targetSearches} 次）`);
+        return target;
+    }
+
+    /** 本轮的目标次数。init 里定好，其余地方一律读这个。 */
+    function runTarget() {
+        return state.target || config.targetSearches;
+    }
+
+    /** 奖励面板不必每轮都查——真人不会每搜一次就点开积分面板看一眼。 */
+    function shouldCheckSidebar() {
+        if (state.sidebarFailures >= 3 || config.sidebarEvery <= 0) return false;
+        if (state.searchCount >= runTarget()) return true;          // 收工前看一眼
+        return state.searchCount > 0 && state.searchCount % config.sidebarEvery === 0;
     }
 
     /**
@@ -2148,11 +2322,24 @@
     }
 
     function remainingSearches() {
-        return Math.max(0, config.targetSearches - state.searchCount);
+        return Math.max(0, runTarget() - state.searchCount);
     }
 
-    /** 发起搜索：直接跳转比填表单提交更可靠（不依赖 Bing 表单里的隐藏字段与事件）。 */
-    function doSearch() {
+    function markIntentionalNav() {
+        try {
+            sessionStorage.setItem(NAV_FLAG_KEY, '1');   // 标记：下一次加载是脚本自己发起的
+        } catch (e) { /* 忽略 */ }
+    }
+
+    /**
+     * 发起一次搜索。
+     *
+     * 优先走「在搜索框里逐字打字再提交表单」这条路：直接 location.assign 到
+     * /search?q=…&form=QBRE 固然可靠，但那一次检索没有任何前戏——没有输入事件、
+     * 没有联想请求，URL 上也没有输入框提交才会带上的那些参数。
+     * 打字失败（页面上没有搜索框、或者提交没生效）就退回直接跳转，流程不会卡住。
+     */
+    async function doSearch() {
         const picked = pickTerm();
         if (!picked) {
             stop('没有可用的搜索词，已停止');
@@ -2165,17 +2352,66 @@
         state.phaseUntil = 0;
         saveSession(); // 跳转前同步写入，绝不能丢
 
-        try {
-            sessionStorage.setItem(NAV_FLAG_KEY, '1');   // 标记：下一次加载是脚本自己发起的
-        } catch (e) { /* 忽略 */ }
+        setStatus(`搜索: ${picked.term}（${picked.source}）· 话题「${state.currentTopic}」${state.walkSteps}/${state.walkLimit} 步 · 第 ${state.searchCount}/${runTarget()} 次`);
+        renderProgress();
 
+        if (config.typeQuery && await typeAndSubmit(picked.term)) return true;
+
+        markIntentionalNav();
         const url = new URL('/search', location.origin);
         url.searchParams.set('q', picked.term);
         url.searchParams.set('form', 'QBRE');
-        setStatus(`搜索: ${picked.term}（${picked.source}）· 话题「${state.currentTopic}」${state.walkSteps}/${state.walkLimit} 步 · 第 ${state.searchCount}/${config.targetSearches} 次`);
-        renderProgress();
         location.assign(url.toString());
         return true;
+    }
+
+    /**
+     * 把词逐字打进搜索框再提交。每个字之间的间隔是随机的，打完还会停一下
+     * ——顺带让 Bing 的联想请求真实发生，这本来就是真人检索的一部分。
+     * 返回 false 表示这条路没走通，调用方会退回直接跳转。
+     */
+    async function typeAndSubmit(term) {
+        const box = document.querySelector('#sb_form_q, input[name="q"]:not([type="hidden"])');
+        const form = box && (box.form || document.querySelector('#sb_form'));
+        if (!box || !form || box.offsetParent === null) return false;
+
+        try {
+            box.focus();
+            box.click();
+            setNativeValue(box, '');
+            for (const ch of term) {
+                setNativeValue(box, box.value + ch);
+                box.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true }));
+                box.dispatchEvent(new KeyboardEvent('keyup', { key: ch, bubbles: true }));
+                await sleep(TYPE_DELAY[0] + Math.random() * (TYPE_DELAY[1] - TYPE_DELAY[0]));
+            }
+            await sleep(TYPE_SETTLE[0] + Math.random() * (TYPE_SETTLE[1] - TYPE_SETTLE[0]));
+
+            markIntentionalNav();
+            if (typeof form.requestSubmit === 'function') form.requestSubmit();
+            else form.submit();
+
+            // 提交没生效的话页面还留在这儿，等一会儿还没跳走就认栽
+            await sleep(SUBMIT_WATCHDOG);
+            log('表单提交后没有跳转，改用直接跳转');
+            return false;
+        } catch (e) {
+            if (e === ABORT) throw e;
+            log('搜索框输入失败，改用直接跳转:', e && e.message);
+            return false;
+        }
+    }
+
+    /**
+     * 给受控输入框赋值。React/框架化的输入框会拦截 value 的直接赋值，
+     * 走原型上的 setter 再补一个 input 事件才能让页面自己的监听收到。
+     */
+    function setNativeValue(input, value) {
+        const proto = pageWindow.HTMLInputElement && pageWindow.HTMLInputElement.prototype;
+        const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+        if (setter && setter.set) setter.set.call(input, value);
+        else input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
     /** 一次完整循环，运行在「上一次搜索跳转后的新页面」上，最后以一次跳转结束。 */
@@ -2192,23 +2428,30 @@
                     setStatus(`停留 ${settle} 秒，等待 Bing 记账...`);
                     await waitSeconds(settle, Phase.SETTLE);
                 }
-                await checkPhase();
+                if (shouldCheckSidebar()) await checkPhase();
             } else {
                 // 不在结果页（比如首页）就别装浏览了，直接读一次奖励面板
-                await checkPhase();
+                if (shouldCheckSidebar()) await checkPhase();
             }
 
-            // 唯一的终止条件：检索够 targetSearches 次。
-            if (state.searchCount >= config.targetSearches) {
+            // 唯一的终止条件：搜够今天计划的次数。
+            if (state.searchCount >= runTarget()) {
                 showCompletionNotification();
                 stop(`已完成 ${state.searchCount} 次检索 🎉`);
                 return;
             }
 
-            // 每搜够 restEvery 次歇一会儿。以前这个休息由「进度没涨」触发，
-            // 但那个判断依赖积分读数，读错就乱歇，现在直接按次数来。
-            if (config.restEvery > 0 && state.searchCount > 0 &&
-                state.searchCount % config.restEvery === 0) {
+            // 两级休息：小休是喝口水，长休是「这一轮先到这儿」——
+            // 一天 40 次一口气连着搜完，本身就不像人在用搜索引擎。
+            const longBreak = config.longBreakEvery > 0 && state.searchCount > 0 &&
+                state.searchCount % config.longBreakEvery === 0;
+            const shortRest = config.restEvery > 0 && state.searchCount > 0 &&
+                state.searchCount % config.restEvery === 0;
+            if (longBreak) {
+                const rest = humanize(config.longBreakTime);
+                setStatus(`这一轮告一段落，休息 ${Math.round(rest / 60)} 分钟再继续`);
+                await waitSeconds(rest, Phase.REST);
+            } else if (shortRest) {
                 const rest = humanize(config.restTime);
                 setStatus(`已连续检索 ${state.searchCount} 次，休息 ${Math.round(rest / 60 * 10) / 10} 分钟`);
                 await waitSeconds(rest, Phase.REST);
@@ -2222,7 +2465,7 @@
             setStatus(`等待 ${gap} 秒后进行下一次搜索`);
             await waitSeconds(gap, Phase.INTERVAL);
 
-            doSearch();
+            await doSearch();
         } catch (e) {
             if (e === ABORT) {
                 log('循环已中断');
@@ -2257,12 +2500,18 @@
         }
         if (!state.running) return;
 
-        if (state.searchCount >= config.targetSearches) {
-            stop(`今日已检索 ${state.searchCount} 次，达到设定次数`);
+        if (state.searchCount >= runTarget()) {
+            stop(`今日已检索 ${state.searchCount} 次，达到今天的计划次数`);
             return;
         }
         // 起始话题池永远兜得住，不再需要「没有搜索词就无法开始」这条分支
-        doSearch();
+        try {
+            await doSearch();
+        } catch (e) {
+            if (e === ABORT) return;          // 打字打到一半被按了停止
+            log('发起搜索失败:', e && e.message);
+            stop('因错误停止');
+        }
     }
 
     function stop(message) {
@@ -2449,6 +2698,7 @@
 
         loadConfig();
         loadTermHistory();
+        state.target = dailyTarget();
         createUI();
         applyCollapse();
         renderProgress();
